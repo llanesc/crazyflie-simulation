@@ -130,7 +130,7 @@ namespace crazyflie_interface
 			bool socketInit;
 			struct sockaddr_in remaddr_cfLib;
 			socklen_t addrlen_cfLib;
-			bool socketInit_cfLib;
+			std::atomic<bool> cfLibAddrInitialized_;
 
 			bool isInit;
 			bool isPluginOn;

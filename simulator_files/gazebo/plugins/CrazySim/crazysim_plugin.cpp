@@ -26,7 +26,7 @@ GzCrazyflieInterface::GzCrazyflieInterface() :
 
 GzCrazyflieInterface::~GzCrazyflieInterface() {
 	isPluginOn = false;
-	socketInit_cfLib = false;
+	cfLibAddrInitialized_ = false;
 	socketInit = false;
 	isInit = false;
 	
@@ -118,7 +118,7 @@ void GzCrazyflieInterface::Configure(const gz::sim::Entity &_entity,
 	addrlen_cfLib = sizeof(remaddr_cfLib);
 	isInit = false;
 	socketInit = false;
-	socketInit_cfLib = false;
+	cfLibAddrInitialized_ = false;
 	m_motor_command_.m1 = 0;
 	m_motor_command_.m2 = 0;
 	m_motor_command_.m3 = 0;
@@ -227,7 +227,7 @@ void GzCrazyflieInterface::recvCfFirmwareThread() {
 		}
 		else if (socketInit && (crtp(buf[0]) == crtp(0x09,0)) && (len == 9)) // Motor command message
 			handleMotorsMessage(&buf[0]);
-		else if (socketInit && socketInit_cfLib){
+		else if (socketInit && cfLibAddrInitialized_){
 			crtpPacket_t packet;
 			packet.size = len - 1;
 			memcpy(&packet.raw[0] , &buf[0], sizeof(uint8_t) * len);
@@ -247,21 +247,20 @@ void GzCrazyflieInterface::recvCfLibThread() {
 		int len = recvfrom(fd_cfLib, buf, sizeof(buf), 0, (struct sockaddr *) &remaddr_rcv_cfLib, &addrlen_rcv_cfLib);
 		if (len <= 0 )
 			continue;
-		if (!socketInit_cfLib && buf[0] == 0xF3 && len == 1){
-			gzmsg << "Received CfLib handshake message..." << std::endl;
-			remaddr_cfLib = remaddr_rcv_cfLib;
-			addrlen_cfLib = addrlen_rcv_cfLib;
-			socketInit_cfLib = true;
-			// Send response to CfLib
-			// uint8_t data[1] = {0xF3};
-			// sendCfLib(data , sizeof(data));
+
+		// Update cflib address on every received packet (activity-based detection)
+		remaddr_cfLib = remaddr_rcv_cfLib;
+		addrlen_cfLib = addrlen_rcv_cfLib;
+		cfLibAddrInitialized_ = true;
+
+		// Echo back null CRTP packets (0xFF) for scan/ping
+		if (buf[0] == 0xFF && len == 1) {
+			uint8_t echo[1] = {0xFF};
+			sendCfLib(echo, sizeof(echo));
 		}
-		else if (socketInit_cfLib && buf[0] == 0xF4 && len == 1) {
-			socketInit_cfLib = false;
-		}
-		else if (socketInit_cfLib) {
-			recvCfLib(&buf[0], len);
-		}
+
+		// Forward all packets to firmware
+		recvCfLib(&buf[0], len);
 	}
 }
 
@@ -297,7 +296,7 @@ void GzCrazyflieInterface::sendCfFirmwareThread() {
 void GzCrazyflieInterface::sendCfLibThread() {
 	crtpPacket_t msgs[10];
 	while(isPluginOn){
-		if(!socketInit || !socketInit_cfLib)
+		if(!socketInit || !cfLibAddrInitialized_)
 			continue;
 
 		size_t cflib_msg_count = firmware_to_cflib_queue.wait_dequeue_bulk(msgs, 10);

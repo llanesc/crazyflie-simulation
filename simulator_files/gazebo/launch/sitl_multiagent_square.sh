@@ -84,7 +84,7 @@ sleep 1
 source ${src_path}/tools/crazyflie-simulation/simulator_files/gazebo/launch/setup_gz.bash ${src_path} ${build_path}
 
 echo "Starting gazebo"
-gz sim -s -r ${src_path}/tools/crazyflie-simulation/simulator_files/gazebo/worlds/${world}.sdf -v 0 &
+gz sim -s -r ${src_path}/tools/crazyflie-simulation/simulator_files/gazebo/worlds/${world}.sdf -v 3 &
 sleep 3
 
 if [ $num_vehicles -gt 255 ]
@@ -94,7 +94,7 @@ then
 fi
 n=0
 while [ $n -lt $num_vehicles ]; do
-	denom=$(python -c "from math import ceil, sqrt; print(ceil(sqrt($num_vehicles)))")
+	denom=$(python3 -c "from math import ceil, sqrt; print(ceil(sqrt($num_vehicles)))")
 	x_cord=$(($n%$denom))
 	y_cord=$(($n/$denom - ($n%$denom)/$denom))
 	spawn_model ${vehicle_model} $(($n)) $x_cord $y_cord

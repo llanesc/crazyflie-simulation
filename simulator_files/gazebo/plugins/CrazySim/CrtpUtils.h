@@ -3,6 +3,7 @@
 
 #include <iostream>
 #include <cstdint>
+#include <cmath>
 #include "crtp.h"
 
 #define CRTP_PORT_SETPOINT_SIM 0x09
@@ -22,8 +23,18 @@
 
 #define GRAVITY_MAGNITUDE_CF (9.81) // we use the magnitude such that the sign/direction is explicit in calculations
 
-#define PWM2OMEGA(pwm) ((pwm) < (1000) ? (0) : ((0.04076521f*pwm) + 380.8359f))
-// #define PWM2OMEGA(pwm) ((pwm) < (1000) ? (0) : ((0.03419482*pwm) + 353.424884428f))
+// OLD linear model (commented out):
+// #define PWM2OMEGA(pwm) ((pwm) < (1000) ? (0) : ((0.04076521f*pwm) + 380.8359f))
+
+// NEW: Matches Crazyflow's linear thrust model
+// thrust_desired = (pwm / 65535) * 0.18 N
+// omega = sqrt(thrust_desired / motorConstant)
+static inline float PWM2OMEGA(uint16_t pwm) {
+    if (pwm < 7000) return 0.0f;
+    float thrust_desired = (pwm / 65535.0f) * 0.18f;
+    float omega = std::sqrt(thrust_desired / 2.3375e-8f);
+    return std::fmin(omega, 2591.0f);  // Cap at maxRotVelocity
+}
 
 // Sensor type (first byte of crtp packet)
 enum SensorTypeSim_e {

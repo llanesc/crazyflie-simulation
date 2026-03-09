@@ -33,7 +33,7 @@ static inline float PWM2OMEGA(uint16_t pwm) {
     if (pwm < 7000) return 0.0f;
     float thrust_desired = (pwm / 65535.0f) * 0.18f;
     float omega = std::sqrt(thrust_desired / 2.3375e-8f);
-    return std::fmin(omega, 2591.0f);  // Cap at maxRotVelocity
+    return std::fmin(omega, 2797.0f);  // Cap at maxRotVelocity
 }
 
 // Sensor type (first byte of crtp packet)

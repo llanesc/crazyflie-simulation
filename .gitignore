@@ -1,2 +1,8 @@
 *.blend1
 *.pyc
+
+# Gazebo plugin build artifacts
+simulator_files/gazebo/plugins/CrazySim/build/
+
+# Drone spawn list
+simulator_files/gazebo/launch/drone_spawn_list/

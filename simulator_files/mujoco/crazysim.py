@@ -126,6 +126,8 @@ class MotorParams:
     max_rpm:         float   # RPM clamp
     mass:            float   # kg
     diaginertia:     tuple[float, float, float]  # Ixx, Iyy, Izz [kg·m²]
+    drag_matrix:     np.ndarray  # 3×3 aerodynamic drag matrix [N·s/m]
+    prop_inertia:    float       # single propeller inertia [kg·m²]
 
 
 def _max_rpm(rpm2thrust: tuple[float, float, float], thrust_max: float) -> float:
@@ -147,6 +149,8 @@ def _load_motor_params() -> dict[str, MotorParams]:
         rpm2thrust = tuple(p['rpm2thrust'])
         tau = 1.0 / p['rotor_dyn_coef_simple']
         J = p['J']
+        drag_matrix = np.array(p['drag_matrix'], dtype=np.float64)
+        prop_inertia = float(p['prop_inertia'])
         result[name] = MotorParams(
             rpm2thrust=rpm2thrust,
             rpm2torque=tuple(p['rpm2torque']),
@@ -156,6 +160,8 @@ def _load_motor_params() -> dict[str, MotorParams]:
             max_rpm=_max_rpm(rpm2thrust, p['thrust_max']),
             mass=p['mass'],
             diaginertia=(J[0][0], J[1][1], J[2][2]),
+            drag_matrix=drag_matrix,
+            prop_inertia=prop_inertia,
         )
     return result
 
@@ -369,8 +375,10 @@ class DroneAgent:
         self._params = params
         prefix = f'cf{agent_id}_'
 
-        # Body ID
+        # Body ID and free joint qvel address
         self._body_id = model.body(f'{prefix}drone').id
+        jnt_id = model.body(f'{prefix}drone').jntadr[0]
+        self._qvel_adr = model.jnt_dofadr[jnt_id]  # 6 DOFs: [vx,vy,vz,wx,wy,wz]
 
         # Sensor addresses
         self._acc_adr = model.sensor_adr[
@@ -389,6 +397,7 @@ class DroneAgent:
         # Motor state (tracked in RPM to match drone-models polynomial coefficients)
         self._rpm = np.zeros(4)
         self._rpm_ref = np.zeros(4)
+        self._rpm_dot = np.zeros(4)  # RPM/s for gyroscopic z-torque
         self._motor_lock = threading.Lock()
 
         # Baro accumulator
@@ -521,6 +530,7 @@ class DroneAgent:
         a_t, b_t, c_t = p.rpm2thrust
         a_q, b_q, c_q = p.rpm2torque
 
+        rpm_prev = self._rpm.copy()
         for i in range(4):
             tau = p.tau_up if rpm_ref[i] >= self._rpm[i] else p.tau_down
             self._rpm[i] += (rpm_ref[i] - self._rpm[i]) * self.dt / tau
@@ -533,6 +543,53 @@ class DroneAgent:
 
             self.data.ctrl[self._act_force[i]] = thrust
             self.data.ctrl[self._act_torque[i]] = drag_torque
+
+        # Store rotor acceleration (RPM/s) for gyroscopic z-torque
+        self._rpm_dot = (self._rpm - rpm_prev) / self.dt
+
+    def apply_aero_effects(self):
+        """Apply aerodynamic drag via generalized forces (qfrc_applied).
+
+        Uses qfrc_applied on the free joint DOFs instead of xfrc_applied
+        to avoid interactions with MuJoCo's contact solver.
+
+        Only active when motors are spinning (any RPM > 0) to avoid
+        spurious forces from ground contact velocity noise.
+        """
+        # Skip when motors are off — ground contact velocity creates artifacts
+        if np.all(self._rpm < 1.0):
+            return
+
+        p = self._params
+        bid = self._body_id
+        adr = self._qvel_adr
+
+        # Body rotation matrix (3×3, body-to-world) and velocity from free joint
+        R = self.data.xmat[bid].reshape(3, 3)
+        lin_vel_world = self.data.qvel[adr:adr + 3]
+
+        # Aerodynamic drag: velocity to body frame, apply drag, back to world
+        v_body = R.T @ lin_vel_world
+        f_drag_body = p.drag_matrix @ v_body
+        f_drag_world = R @ f_drag_body
+
+        # Gyroscopic precession: τ = -ω_body × h_rotor
+        # h_rotor = [0, 0, prop_inertia * Σ(dir_i * ω_i)]
+        # Result is body-frame torque with zero z-component (pure precession)
+        ang_vel_body = self.data.qvel[adr + 3:adr + 6]
+        net_rotor_vel = float(np.sum(MOTOR_DIR * self._rpm)) * RPM_TO_RADS
+        h_z = p.prop_inertia * net_rotor_vel
+        gyro_torque = np.array([
+            -ang_vel_body[1] * h_z,
+             ang_vel_body[0] * h_z,
+             0.0,
+        ])
+
+        # Apply as generalized forces on the free joint DOFs
+        # Translational (world frame): drag force
+        # Angular (body frame): gyroscopic precession torque
+        self.data.qfrc_applied[adr:adr + 3] = f_drag_world
+        self.data.qfrc_applied[adr + 3:adr + 6] = gyro_torque
 
     def read_imu(self):
         acc = self.data.sensordata[self._acc_adr: self._acc_adr + 3].copy()
@@ -644,6 +701,7 @@ class CrazySimMuJoCo:
             """One physics step + CRTP packet dispatch for all agents."""
             for agent in self.agents:
                 agent.update_motors()
+                agent.apply_aero_effects()
             mujoco.mj_step(self.model, self.data)
             for agent in self.agents:
                 agent.send_sensor_data()

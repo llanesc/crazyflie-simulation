@@ -124,6 +124,8 @@ class MotorParams:
     tau_down:        float   # s
     pwm_thrust_full: float   # N
     max_rpm:         float   # RPM clamp
+    mass:            float   # kg
+    diaginertia:     tuple[float, float, float]  # Ixx, Iyy, Izz [kg·m²]
 
 
 def _max_rpm(rpm2thrust: tuple[float, float, float], thrust_max: float) -> float:
@@ -144,6 +146,7 @@ def _load_motor_params() -> dict[str, MotorParams]:
     for name, p in all_params.items():
         rpm2thrust = tuple(p['rpm2thrust'])
         tau = 1.0 / p['rotor_dyn_coef_simple']
+        J = p['J']
         result[name] = MotorParams(
             rpm2thrust=rpm2thrust,
             rpm2torque=tuple(p['rpm2torque']),
@@ -151,6 +154,8 @@ def _load_motor_params() -> dict[str, MotorParams]:
             tau_down=tau,
             pwm_thrust_full=p['thrust_max'],
             max_rpm=_max_rpm(rpm2thrust, p['thrust_max']),
+            mass=p['mass'],
+            diaginertia=(J[0][0], J[1][1], J[2][2]),
         )
     return result
 
@@ -231,9 +236,16 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _SCENE_XML = os.path.join(_HERE, 'scene.xml')
 
 
-def _patch_drone_spec(spec: mujoco.MjSpec) -> None:
-    """Add IMU site and sensors required by CrazySim to an upstream drone-models spec."""
+def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
+    """Patch an upstream drone-models spec with CrazySim requirements.
+
+    - Override mass and inertia from params.toml (authoritative source)
+    - Add IMU site and accelerometer/gyro sensors
+    """
     drone = spec.body('drone')
+    # Override mass and inertia from params.toml
+    drone.mass = params.mass
+    drone.inertia = [params.diaginertia[0], params.diaginertia[1], params.diaginertia[2]]
     # Add IMU site at body center (if not already present)
     if spec.site('imu') is None:
         drone.add_site(name='imu', pos=[0, 0, 0], group=5)
@@ -246,7 +258,8 @@ def _patch_drone_spec(spec: mujoco.MjSpec) -> None:
                         objtype=mujoco.mjtObj.mjOBJ_SITE, objname='imu')
 
 
-def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]]) -> mujoco.MjSpec:
+def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]],
+                      params: MotorParams) -> mujoco.MjSpec:
     """
     Combine scene.xml + N drone models using MjSpec.
     Each drone body is attached at a unique spawn position with a unique
@@ -257,7 +270,7 @@ def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]]
 
     for i, (x, y) in enumerate(spawn_positions):
         drone_spec = mujoco.MjSpec.from_file(drone_xml)
-        _patch_drone_spec(drone_spec)
+        _patch_drone_spec(drone_spec, params)
         frame = scene_spec.worldbody.add_frame()
         frame.pos = [x, y, 0.0]
         prefix = f'cf{i}_'
@@ -267,13 +280,14 @@ def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]]
     return scene_spec
 
 
-def _build_spec_multi_safe(drone_xml: str, spawn_positions: list[tuple[float, float]]) -> mujoco.MjModel:
+def _build_spec_multi_safe(drone_xml: str, spawn_positions: list[tuple[float, float]],
+                           params: MotorParams) -> mujoco.MjModel:
     """
     Build multi-agent model. Falls back to mesh-stripped drone if STL assets
     are missing.
     """
     try:
-        return _build_spec_multi(drone_xml, spawn_positions).compile()
+        return _build_spec_multi(drone_xml, spawn_positions, params).compile()
     except ValueError as exc:
         err = str(exc)
         if 'opening file' not in err and '.stl' not in err.lower():
@@ -287,7 +301,7 @@ def _build_spec_multi_safe(drone_xml: str, spawn_positions: list[tuple[float, fl
 
         for i, (x, y) in enumerate(spawn_positions):
             drone_spec = mujoco.MjSpec.from_string(stripped_xml)
-            _patch_drone_spec(drone_spec)
+            _patch_drone_spec(drone_spec, params)
             frame = scene_spec.worldbody.add_frame()
             frame.pos = [x, y, 0.0]
             prefix = f'cf{i}_'
@@ -576,8 +590,11 @@ class CrazySimMuJoCo:
         print(f'[crazysim] tau_up/down : {params.tau_up:.4f} / {params.tau_down:.4f} s')
         print(f'[crazysim] max_rpm     : {params.max_rpm:.0f}')
 
+        print(f'[crazysim] mass       : {params.mass:.4f} kg')
+        print(f'[crazysim] diaginertia: {params.diaginertia}')
+
         # Build shared MuJoCo model with all drones
-        self.model = _build_spec_multi_safe(model_path, spawn_positions)
+        self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
         self.model.opt.timestep = self.dt
         self.data = mujoco.MjData(self.model)
 
@@ -723,6 +740,8 @@ def main():
                    help='Spawn positions as X,Y pairs (e.g., 0,0 1,0 0,1)')
     p.add_argument('--spawn-file', default=None,
                    help='CSV file with spawn positions (one X,Y per line)')
+    p.add_argument('--mass', type=float, default=None,
+                   help='Override drone mass [kg]')
     args = p.parse_args()
 
     # Resolve model type
@@ -731,6 +750,11 @@ def main():
         model_type = _infer_model_type(args.model)
     if model_type is None:
         model_type = DEFAULT_MODEL_TYPE
+
+    # Apply mass override if provided
+    if args.mass is not None:
+        from dataclasses import replace
+        MOTOR_PARAMS[model_type] = replace(MOTOR_PARAMS[model_type], mass=args.mass)
 
     # Resolve model path (default paths are relative to this script)
     model_path = args.model

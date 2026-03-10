@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch multiple Crazyflie SITL agents in a square formation with MuJoCo.
 #
-# Usage: ./sitl_multiagent_square.sh [-n <num_vehicles>] [-m <model_type>] [-d <dt>]
+# Usage: ./sitl_multiagent_square.sh [-n <num_vehicles>] [-m <model_type>] [-d <dt>] [-M <mass_kg>]
 #
 # This starts N cf2 firmware instances (ports 19950..19950+N-1) and one
 # crazysim.py process with all drones in a single MuJoCo world.
@@ -12,17 +12,18 @@ function cleanup() {
 
 if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "Description: Launch multiple Crazyflie SITL agents in a square formation in MuJoCo."
-	echo "Usage: $0 [-n <num_vehicles>] [-m <model_type>] [-d <dt>]"
+	echo "Usage: $0 [-n <num_vehicles>] [-m <model_type>] [-d <dt>] [-M <mass_kg>]"
 	echo ""
 	echo "Model types: cf2x_T350 (default), cf2x_L250, cf2x_P250, cf21B_500"
 	exit 1
 fi
 
-while getopts n:m:d: option; do
+while getopts n:m:d:M: option; do
 	case "${option}" in
 		n) NUM_VEHICLES=${OPTARG};;
 		m) MODEL_TYPE=${OPTARG};;
 		d) DT=${OPTARG};;
+		M) MASS=${OPTARG};;
 	esac
 done
 
@@ -70,9 +71,13 @@ trap "cleanup" SIGINT SIGTERM EXIT
 
 # Start MuJoCo crazysim with all agents
 echo "Starting MuJoCo CrazySim with ${num_vehicles} agents, model_type=${model_type}"
+mass_arg=""
+[ -n "${MASS}" ] && mass_arg="--mass ${MASS}"
+
 python3 "$crazysim_dir/crazysim.py" \
 	--model-type "${model_type}" \
 	--port 19950 \
 	--vis \
 	--dt "${dt}" \
+	${mass_arg} \
 	-- ${spawn_args}

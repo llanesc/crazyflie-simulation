@@ -1,0 +1,3 @@
+[submodule "simulator_files/mujoco/drone-models"]
+	path = simulator_files/mujoco/drone-models
+	url = https://github.com/utiasDSL/drone-models.git

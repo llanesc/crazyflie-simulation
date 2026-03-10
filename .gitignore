@@ -5,4 +5,9 @@
 simulator_files/gazebo/plugins/CrazySim/build/
 
 # Drone spawn list
-simulator_files/gazebo/launch/drone_spawn_list/
+drone_spawn_list/
+
+# MuJoCo Python cache
+simulator_files/mujoco/__pycache__/
+simulator_files/mujoco/*.pyc
+

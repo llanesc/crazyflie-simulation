@@ -246,6 +246,15 @@ def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
     # Override mass and inertia from params.toml
     drone.mass = params.mass
     drone.inertia = [params.diaginertia[0], params.diaginertia[1], params.diaginertia[2]]
+    # Swap collision geometry: disable sphere, enable box
+    col_sphere = spec.geom('col_sphere')
+    if col_sphere is not None:
+        col_sphere.contype = 0
+        col_sphere.conaffinity = 0
+    col_box = spec.geom('col_box')
+    if col_box is not None:
+        col_box.contype = 1
+        col_box.conaffinity = 1
     # Add IMU site at body center (if not already present)
     if spec.site('imu') is None:
         drone.add_site(name='imu', pos=[0, 0, 0], group=5)
@@ -639,12 +648,30 @@ class CrazySimMuJoCo:
             for agent in self.agents:
                 agent.send_sensor_data()
 
+        # Real-time factor tracking
+        _rtf_interval = 1.0  # seconds between RTF updates
+        _rtf_wall_start = time.perf_counter()
+        _rtf_sim_start = self.data.time
+        _rtf_value = 0.0
+
+        def _update_rtf():
+            nonlocal _rtf_wall_start, _rtf_sim_start, _rtf_value
+            wall_now = time.perf_counter()
+            wall_dt = wall_now - _rtf_wall_start
+            if wall_dt >= _rtf_interval:
+                sim_dt = self.data.time - _rtf_sim_start
+                _rtf_value = sim_dt / wall_dt if wall_dt > 0 else 0.0
+                _rtf_wall_start = wall_now
+                _rtf_sim_start = self.data.time
+
         if self.visualize:
+            _render_interval = 1.0 / 60.0  # 60 FPS render rate
             with mujoco.viewer.launch_passive(self.model, self.data,
                                               show_left_ui=False,
                                               show_right_ui=False) as v:
                 # Force initial camera: look from behind drone toward +X.
                 _cam_init_frames = 5
+                _last_render = 0.0
                 while v.is_running() and self._running:
                     t0 = time.perf_counter()
                     with v.lock():
@@ -656,7 +683,16 @@ class CrazySimMuJoCo:
                             v.cam.distance = 3.0
                             v.cam.lookat[:] = [0.0, 0.0, 0.5]
                             _cam_init_frames -= 1
-                    v.sync()
+                    _update_rtf()
+                    if t0 - _last_render >= _render_interval:
+                        v.set_texts((
+                            mujoco.mjtFontScale.mjFONTSCALE_150,
+                            mujoco.mjtGridPos.mjGRID_BOTTOMRIGHT,
+                            f'RTF: {_rtf_value:.2f}x',
+                            f't={self.data.time:.1f}s',
+                        ))
+                        v.sync()
+                        _last_render = t0
                     elapsed = time.perf_counter() - t0
                     sleep_t = self.dt - elapsed
                     if sleep_t > 0:
@@ -667,6 +703,7 @@ class CrazySimMuJoCo:
                 while self._running:
                     t0 = time.perf_counter()
                     _step_and_send()
+                    _update_rtf()
                     elapsed = time.perf_counter() - t0
                     sleep_t = self.dt - elapsed
                     if sleep_t > 0:

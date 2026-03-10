@@ -58,7 +58,6 @@ trap "cleanup" SIGINT SIGTERM EXIT
 echo "Starting MuJoCo CrazySim with model_type=${model_type}"
 mass_arg=""
 [ -n "${MASS}" ] && mass_arg="--mass ${MASS}"
-
 python3 "$crazysim_dir/crazysim.py" \
 	--model-type "${model_type}" \
 	--port 19950 \

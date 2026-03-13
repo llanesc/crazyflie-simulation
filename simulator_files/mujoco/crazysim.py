@@ -21,6 +21,11 @@ Protocol (socketlink.c / CrtpUtils.h):
     bytes 6-9 : float  temperature [°C]
     bytes 10-13: float asl        [m]
 
+  Range packet (sim → firmware, CRTP port 0x09 ch 0):
+    byte 0    : header = 0x90
+    byte 1    : type   = SENSOR_RANGE_SIM (3)
+    bytes 2-21: 5 × float32 (front, back, left, right, up) [m]
+
   Pose packet (sim → firmware, CRTP port 0x06 ch 1):
     byte 0    : header = 0x65
     byte 1    : id     = CRTP_GEN_LOC_ID_EXT_POS (0x08)
@@ -70,11 +75,13 @@ import numpy as np
 # ---------------------------------------------------------------------------
 CRTP_PORT_SIM    = 0x09
 CRTP_PORT_LOC    = 0x06
-CRTP_HDR_SIM     = (CRTP_PORT_SIM << 4) | 0           # 0x90
+CRTP_HDR_SIM     = (CRTP_PORT_SIM << 4) | 0           # 0x90  (SIM port, ch 0 — motors)
+CRTP_HDR_LED     = (CRTP_PORT_SIM << 4) | 1           # 0x91  (SIM port, ch 1 — LED RGB)
 CRTP_HDR_LOC     = (CRTP_PORT_LOC << 4) | (1 << 2) | 1  # 0x65
 
 SENSOR_GYRO_ACC  = 0
 SENSOR_BARO      = 2
+SENSOR_RANGE     = 3
 GEN_LOC_EXT_POSE = 0x08
 
 # LSB conversion factors (firmware sensors_sitl.c)
@@ -95,6 +102,8 @@ L_LAPSE  = 0.0065
 R_GAS    = 8.314
 M_AIR    = 0.0289644
 BARO_RATE_HZ = 50
+RANGE_RATE_HZ = 10         # Multi-ranger update rate (matches real hardware)
+RANGE_MAX_M   = 4.0        # VL53L1x max range [m]
 CFLIB_PORT_OFFSET = -100   # cflib port = firmware port + offset (19950 → 19850)
 
 # ---------------------------------------------------------------------------
@@ -234,6 +243,13 @@ def make_pose_packet(pos: np.ndarray, quat_xyzw: np.ndarray) -> bytes:
                           quat_xyzw[0], quat_xyzw[1],
                           quat_xyzw[2], quat_xyzw[3])
     return bytes([CRTP_HDR_LOC]) + payload   # 1 + 29 = 30 bytes
+
+
+def make_range_packet(front: float, back: float, left: float,
+                      right: float, up: float) -> bytes:
+    """Pack multi-ranger CRTP packet (22 bytes total)."""
+    payload = struct.pack('<Bfffff', SENSOR_RANGE, front, back, left, right, up)
+    return bytes([CRTP_HDR_SIM]) + payload   # 1 + 21 = 22 bytes
 
 
 # ---------------------------------------------------------------------------
@@ -400,8 +416,21 @@ class DroneAgent:
         self._rpm_dot = np.zeros(4)  # RPM/s for gyroscopic z-torque
         self._motor_lock = threading.Lock()
 
+        # LED material indices (for dynamic color updates from firmware)
+        self._led_mat_ids = []
+        for name in ('led_top', 'led_bot'):
+            mid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, f'{prefix}{name}')
+            if mid >= 0:
+                self._led_mat_ids.append(mid)
+        self._led_rgb = np.zeros(3)  # current LED color [0..1]
+        self._led_lock = threading.Lock()
+
         # Baro accumulator
         self._baro_acc = 0.0
+        # Range accumulator
+        self._range_acc = 0.0
+        # Geom group mask for raycasting (include all groups)
+        self._ray_geomgroup = np.ones(6, dtype=np.uint8)
 
         # UDP socket (firmware)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -471,11 +500,17 @@ class DroneAgent:
                 break
             if len(data) < 1:
                 continue
-            port_nibble = (data[0] >> 4) & 0x0F
-            if port_nibble == CRTP_PORT_SIM and len(data) >= 9:
+            hdr = data[0]
+            if hdr == CRTP_HDR_SIM and len(data) >= 9:
+                # Motor PWM packet (SIM port, channel 0)
                 m0, m1, m2, m3 = struct.unpack_from('<HHHH', data, 1)
                 with self._motor_lock:
                     self._rpm_ref[:] = [self._pwm_to_rpm(p) for p in (m0, m1, m2, m3)]
+            elif hdr == CRTP_HDR_LED and len(data) >= 4:
+                # LED RGB packet (SIM port, channel 1): [R, G, B] as uint8
+                r, g, b = data[1], data[2], data[3]
+                with self._led_lock:
+                    self._led_rgb[:] = [r / 255.0, g / 255.0, b / 255.0]
             else:
                 with self._cflib_addr_lock:
                     has_cflib = self._cflib_addr is not None
@@ -602,6 +637,39 @@ class DroneAgent:
         q_xyzw = np.array([q_wxyz[1], q_wxyz[2], q_wxyz[3], q_wxyz[0]])
         return pos, q_xyzw
 
+    def read_ranges(self) -> tuple[float, float, float, float, float]:
+        """Cast 5 rays in body-frame directions, return distances [m] clamped to max range."""
+        bid = self._body_id
+        pos = self.data.xpos[bid]
+        R = self.data.xmat[bid].reshape(3, 3)
+
+        # Body-frame directions: front=+X, back=-X, left=+Y, right=-Y, up=+Z
+        directions_body = (
+            np.array([1.0, 0.0, 0.0]),
+            np.array([-1.0, 0.0, 0.0]),
+            np.array([0.0, 1.0, 0.0]),
+            np.array([0.0, -1.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
+        )
+
+        ranges = []
+        for d_body in directions_body:
+            d_world = R @ d_body
+            geom_id = np.array([-1], dtype=np.int32)
+            dist = mujoco.mj_ray(
+                self.model, self.data,
+                pos, d_world,
+                self._ray_geomgroup,
+                1,      # flg_static: include static geoms (floor, walls)
+                bid,    # bodyexclude: skip drone's own body
+                geom_id,
+            )
+            if dist < 0 or dist > RANGE_MAX_M:
+                dist = RANGE_MAX_M
+            ranges.append(dist)
+
+        return tuple(ranges)
+
     def send_sensor_data(self):
         if not self._firmware_addr:
             return
@@ -617,6 +685,15 @@ class DroneAgent:
             self._baro_acc -= baro_period
             self._sock.sendto(make_baro_packet(pos[2]), self._firmware_addr)
 
+        # Multi-ranger at RANGE_RATE_HZ
+        range_period = 1.0 / RANGE_RATE_HZ
+        self._range_acc += self.dt
+        if self._range_acc >= range_period:
+            self._range_acc -= range_period
+            front, back, left, right, up = self.read_ranges()
+            self._sock.sendto(make_range_packet(front, back, left, right, up),
+                              self._firmware_addr)
+
         # Drain cflib→firmware queue
         while not self._cflib_to_firmware_q.empty():
             try:
@@ -624,6 +701,17 @@ class DroneAgent:
                 self._sock.sendto(pkt, self._firmware_addr)
             except queue.Empty:
                 break
+
+    def update_led_materials(self):
+        """Apply the latest LED RGB color to the MuJoCo led_top/led_bot materials."""
+        if not self._led_mat_ids:
+            return
+        with self._led_lock:
+            r, g, b = self._led_rgb
+        # Alpha = 0 when LED is off (all zeros), 1 when any color is set
+        alpha = 1.0 if (r > 0 or g > 0 or b > 0) else 0.0
+        for mid in self._led_mat_ids:
+            self.model.mat_rgba[mid] = [r, g, b, alpha]
 
 
 # ---------------------------------------------------------------------------
@@ -702,6 +790,7 @@ class CrazySimMuJoCo:
             for agent in self.agents:
                 agent.update_motors()
                 agent.apply_aero_effects()
+                agent.update_led_materials()
             mujoco.mj_step(self.model, self.data)
             for agent in self.agents:
                 agent.send_sensor_data()
@@ -837,7 +926,19 @@ def main():
                    help='CSV file with spawn positions (one X,Y per line)')
     p.add_argument('--mass', type=float, default=None,
                    help='Override drone mass [kg]')
+    p.add_argument('--scene', default=None,
+                   help='Path to scene MJCF XML (default: scene.xml)')
     args = p.parse_args()
+
+    # Override scene XML if provided
+    global _SCENE_XML
+    if args.scene is not None:
+        scene_path = args.scene
+        if not os.path.isabs(scene_path) and not os.path.isfile(scene_path):
+            alt = os.path.join(_HERE, scene_path)
+            if os.path.isfile(alt):
+                scene_path = alt
+        _SCENE_XML = scene_path
 
     # Resolve model type
     model_type = args.model_type

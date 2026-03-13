@@ -1,7 +1,7 @@
 #!/bin/bash
 # Launch a single Crazyflie SITL agent with MuJoCo visualization.
 #
-# Usage: ./sitl_singleagent.sh [-m <model_type>] [-x <x>] [-y <y>] [-d <dt>] [-M <mass_kg>]
+# Usage: ./sitl_singleagent.sh [-m <model_type>] [-x <x>] [-y <y>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]
 #
 # This starts one cf2 firmware instance and one crazysim.py process
 # with the passive MuJoCo viewer.
@@ -12,19 +12,21 @@ function cleanup() {
 
 if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "Description: Launch a single Crazyflie SITL agent in MuJoCo."
-	echo "Usage: $0 [-m <model_type>] [-x <x_coordinate>] [-y <y_coordinate>] [-d <dt>] [-M <mass_kg>]"
+	echo "Usage: $0 [-m <model_type>] [-x <x_coordinate>] [-y <y_coordinate>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]"
 	echo ""
 	echo "Model types: cf2x_T350 (default), cf2x_L250, cf2x_P250, cf21B_500"
+	echo "Scene files: scene.xml (default), scene_obstacles.xml"
 	exit 1
 fi
 
-while getopts m:x:y:d:M: option; do
+while getopts m:x:y:d:M:s: option; do
 	case "${option}" in
 		m) MODEL_TYPE=${OPTARG};;
 		x) X_CORD=${OPTARG};;
 		y) Y_CORD=${OPTARG};;
 		d) DT=${OPTARG};;
 		M) MASS=${OPTARG};;
+		s) SCENE=${OPTARG};;
 	esac
 done
 
@@ -58,10 +60,13 @@ trap "cleanup" SIGINT SIGTERM EXIT
 echo "Starting MuJoCo CrazySim with model_type=${model_type}"
 mass_arg=""
 [ -n "${MASS}" ] && mass_arg="--mass ${MASS}"
+scene_arg=""
+[ -n "${SCENE}" ] && scene_arg="--scene ${SCENE}"
 python3 "$crazysim_dir/crazysim.py" \
 	--model-type "${model_type}" \
 	--port 19950 \
 	--vis \
 	--dt "${dt}" \
 	${mass_arg} \
+	${scene_arg} \
 	-- "${x_cord},${y_cord}"

@@ -77,6 +77,7 @@ CRTP_PORT_SIM    = 0x09
 CRTP_PORT_LOC    = 0x06
 CRTP_HDR_SIM     = (CRTP_PORT_SIM << 4) | 0           # 0x90  (SIM port, ch 0 — motors)
 CRTP_HDR_LED     = (CRTP_PORT_SIM << 4) | 1           # 0x91  (SIM port, ch 1 — LED RGB)
+CRTP_HDR_HEADLIGHT = (CRTP_PORT_SIM << 4) | 2         # 0x92  (SIM port, ch 2 — headlight)
 CRTP_HDR_LOC     = (CRTP_PORT_LOC << 4) | (1 << 2) | 1  # 0x65
 
 SENSOR_GYRO_ACC  = 0
@@ -263,6 +264,8 @@ def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
 
     - Override mass and inertia from params.toml (authoritative source)
     - Add IMU site and accelerometer/gyro sensors
+    - Add LED emissive materials, headlight geometry, and point lights
+    - Fix mesh orientation (euler 0 0 90 aligns STL front with body +X)
     """
     drone = spec.body('drone')
     # Override mass and inertia from params.toml
@@ -287,6 +290,73 @@ def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
     if not any(s.name == 'gyro' for s in spec.sensors):
         spec.add_sensor(name='gyro', type=mujoco.mjtSensor.mjSENS_GYRO,
                         objtype=mujoco.mjtObj.mjOBJ_SITE, objname='imu')
+
+    # --- LED and headlight setup ---
+
+    # Make LED materials emissive so they glow in dark scenes
+    for mat_name in ('led_top', 'led_bot'):
+        mat = spec.material(mat_name)
+        if mat is not None:
+            mat.emission = 1.0
+
+    # Add headlight material (emissive, initially transparent)
+    if spec.material('headlight') is None:
+        spec.add_material(name='headlight', rgba=[1.0, 1.0, 0.95, 0.0], emission=1.0)
+
+    # Add headlight geometry at front of PCB
+    if spec.geom('headlight') is None:
+        g = drone.add_geom(name='headlight')
+        g.type = mujoco.mjtGeom.mjGEOM_BOX
+        g.size = [0.002, 0.004, 0.002]
+        g.pos = [0.033, 0, 0.003]
+        g.material = 'headlight'
+        g.contype = 0
+        g.conaffinity = 0
+        g.group = 2
+
+    # Fix mesh orientations: compose Z-90° rotation to align STL front with body +X.
+    _COS45 = 0.7071067811865476
+    # quat for Z-90°: [cos(-45°), 0, 0, sin(-45°)] = [cos45, 0, 0, -sin45]
+    qz = np.array([_COS45, 0.0, 0.0, -_COS45])
+    for geom in drone.geoms:
+        if geom.name in ('col_sphere', 'col_box', 'headlight'):
+            continue
+        if geom.type == mujoco.mjtGeom.mjGEOM_MESH:
+            q0 = np.array(geom.quat)
+            w0, x0, y0, z0 = q0
+            w1, x1, y1, z1 = qz
+            geom.quat = [
+                w1*w0 - x1*x0 - y1*y0 - z1*z0,
+                w1*x0 + x1*w0 + y1*z0 - z1*y0,
+                w1*y0 - x1*z0 + y1*w0 + z1*x0,
+                w1*z0 + x1*y0 - y1*x0 + z1*w0,
+            ]
+
+    # Add omnidirectional point lights at body center
+    for light_name in ('led_top_light', 'led_bot_light'):
+        if not any(l.name == light_name for l in drone.lights):
+            light = drone.add_light(name=light_name)
+            light.pos = [0, 0, 0]
+            light.diffuse = [0, 0, 0]
+            light.specular = [0, 0, 0]
+            light.attenuation = [0, 0, 5]
+            light.cutoff = 180
+            light.exponent = 0
+            light.castshadow = False
+            light.active = False
+
+    # Add directional headlight spot
+    if not any(l.name == 'headlight_light' for l in drone.lights):
+        light = drone.add_light(name='headlight_light')
+        light.pos = [0, 0, 0]
+        light.dir = [1, 0, 0]
+        light.diffuse = [0, 0, 0]
+        light.specular = [0, 0, 0]
+        light.attenuation = [0, 0, 5]
+        light.cutoff = 80
+        light.exponent = 5
+        light.castshadow = False
+        light.active = False
 
 
 def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]],
@@ -417,13 +487,28 @@ class DroneAgent:
         self._motor_lock = threading.Lock()
 
         # LED material indices (for dynamic color updates from firmware)
-        self._led_mat_ids = []
-        for name in ('led_top', 'led_bot'):
-            mid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_MATERIAL, f'{prefix}{name}')
-            if mid >= 0:
-                self._led_mat_ids.append(mid)
-        self._led_rgb = np.zeros(3)  # current LED color [0..1]
+        # Index 0 = bottom, index 1 = top
+        self._led_bot_mat_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_MATERIAL, f'{prefix}led_bot')
+        self._led_top_mat_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_MATERIAL, f'{prefix}led_top')
+        self._led_bot_rgb = np.zeros(3)  # bottom LED color [0..1]
+        self._led_top_rgb = np.zeros(3)  # top LED color [0..1]
         self._led_lock = threading.Lock()
+
+        # Headlight material index
+        self._headlight_mat_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_MATERIAL, f'{prefix}headlight')
+        self._headlight_on = False
+        self._headlight_lock = threading.Lock()
+
+        # Light source indices (for LEDs that illuminate the scene)
+        self._led_top_light_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_LIGHT, f'{prefix}led_top_light')
+        self._led_bot_light_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_LIGHT, f'{prefix}led_bot_light')
+        self._headlight_light_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_LIGHT, f'{prefix}headlight_light')
 
         # Baro accumulator
         self._baro_acc = 0.0
@@ -506,11 +591,19 @@ class DroneAgent:
                 m0, m1, m2, m3 = struct.unpack_from('<HHHH', data, 1)
                 with self._motor_lock:
                     self._rpm_ref[:] = [self._pwm_to_rpm(p) for p in (m0, m1, m2, m3)]
-            elif hdr == CRTP_HDR_LED and len(data) >= 4:
-                # LED RGB packet (SIM port, channel 1): [R, G, B] as uint8
-                r, g, b = data[1], data[2], data[3]
+            elif hdr == CRTP_HDR_LED and len(data) >= 5:
+                # LED RGB packet (SIM port, channel 1): [pos, R, G, B]
+                pos, r, g, b = data[1], data[2], data[3], data[4]
+                rgb = [r / 255.0, g / 255.0, b / 255.0]
                 with self._led_lock:
-                    self._led_rgb[:] = [r / 255.0, g / 255.0, b / 255.0]
+                    if pos == 0:    # bottom
+                        self._led_bot_rgb[:] = rgb
+                    elif pos == 1:  # top
+                        self._led_top_rgb[:] = rgb
+            elif hdr == CRTP_HDR_HEADLIGHT and len(data) >= 2:
+                # Headlight on/off packet (SIM port, channel 2)
+                with self._headlight_lock:
+                    self._headlight_on = bool(data[1])
             else:
                 with self._cflib_addr_lock:
                     has_cflib = self._cflib_addr is not None
@@ -703,15 +796,42 @@ class DroneAgent:
                 break
 
     def update_led_materials(self):
-        """Apply the latest LED RGB color to the MuJoCo led_top/led_bot materials."""
-        if not self._led_mat_ids:
-            return
+        """Apply the latest LED RGB colors to MuJoCo materials and light sources."""
         with self._led_lock:
-            r, g, b = self._led_rgb
-        # Alpha = 0 when LED is off (all zeros), 1 when any color is set
-        alpha = 1.0 if (r > 0 or g > 0 or b > 0) else 0.0
-        for mid in self._led_mat_ids:
-            self.model.mat_rgba[mid] = [r, g, b, alpha]
+            bot_r, bot_g, bot_b = self._led_bot_rgb
+            top_r, top_g, top_b = self._led_top_rgb
+
+        # Bottom LED: material + light
+        bot_on = (bot_r > 0 or bot_g > 0 or bot_b > 0)
+        if self._led_bot_mat_id >= 0:
+            self.model.mat_rgba[self._led_bot_mat_id] = [bot_r, bot_g, bot_b, 1.0 if bot_on else 0.0]
+        if self._led_bot_light_id >= 0:
+            self.model.light_active[self._led_bot_light_id] = bot_on
+            self.model.light_diffuse[self._led_bot_light_id] = [bot_r, bot_g, bot_b]
+            self.model.light_specular[self._led_bot_light_id] = [bot_r * 0.3, bot_g * 0.3, bot_b * 0.3]
+
+        # Top LED: material + light
+        top_on = (top_r > 0 or top_g > 0 or top_b > 0)
+        if self._led_top_mat_id >= 0:
+            self.model.mat_rgba[self._led_top_mat_id] = [top_r, top_g, top_b, 1.0 if top_on else 0.0]
+        if self._led_top_light_id >= 0:
+            self.model.light_active[self._led_top_light_id] = top_on
+            self.model.light_diffuse[self._led_top_light_id] = [top_r, top_g, top_b]
+            self.model.light_specular[self._led_top_light_id] = [top_r * 0.3, top_g * 0.3, top_b * 0.3]
+
+        # Headlight: material + light
+        with self._headlight_lock:
+            hl_on = self._headlight_on
+        if self._headlight_mat_id >= 0:
+            self.model.mat_rgba[self._headlight_mat_id] = [1.0, 1.0, 0.95, 1.0 if hl_on else 0.0]
+        if self._headlight_light_id >= 0:
+            self.model.light_active[self._headlight_light_id] = hl_on
+            if hl_on:
+                self.model.light_diffuse[self._headlight_light_id] = [1.0, 1.0, 0.95]
+                self.model.light_specular[self._headlight_light_id] = [0.3, 0.3, 0.3]
+            else:
+                self.model.light_diffuse[self._headlight_light_id] = [0, 0, 0]
+                self.model.light_specular[self._headlight_light_id] = [0, 0, 0]
 
 
 # ---------------------------------------------------------------------------

@@ -2,6 +2,7 @@
 # Launch multiple Crazyflie SITL agents in a square formation with MuJoCo.
 #
 # Usage: ./sitl_multiagent_square.sh [-n <num_vehicles>] [-m <model_type>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]
+#        [--sensor-noise] [--ground-effect] [--downwash] [--wind-speed <m/s>] [--turbulence <level>]
 #
 # This starts N cf2 firmware instances (ports 19950..19950+N-1) and one
 # crazysim.py process with all drones in a single MuJoCo world.
@@ -13,11 +14,41 @@ function cleanup() {
 if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "Description: Launch multiple Crazyflie SITL agents in a square formation in MuJoCo."
 	echo "Usage: $0 [-n <num_vehicles>] [-m <model_type>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]"
+	echo "          [--sensor-noise] [--ground-effect] [--downwash] [--wind-speed <m/s>] [--turbulence <level>]"
 	echo ""
 	echo "Model types: cf2x_T350 (default), cf2x_L250, cf2x_P250, cf21B_500"
 	echo "Scene files: scene.xml (default), scene_obstacles.xml"
+	echo ""
+	echo "Feature flags:"
+	echo "  --sensor-noise        BMI088 IMU noise model (bias, scale, white noise)"
+	echo "  --ground-effect       Increased thrust near ground"
+	echo "  --downwash            Aerodynamic interaction between drones"
+	echo "  --wind-speed <m/s>    Constant wind speed"
+	echo "  --wind-direction <deg> Wind direction (0=+X, 90=+Y, 180=-X, 270=-Y)"
+	echo "  --gust-intensity <m/s> Random gust peak deviation"
+	echo "  --turbulence <level>  Dryden turbulence (none, light, moderate, severe)"
 	exit 1
 fi
+
+# Parse feature flags (long opts) before getopts
+SENSOR_NOISE=""
+GROUND_EFFECT=""
+DOWNWASH=""
+WIND_ARGS=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+		--sensor-noise)   SENSOR_NOISE="--sensor-noise"; shift;;
+		--ground-effect)  GROUND_EFFECT="--ground-effect"; shift;;
+		--downwash)       DOWNWASH="--downwash"; shift;;
+		--wind-speed)     WIND_ARGS="$WIND_ARGS --wind-speed $2"; shift 2;;
+		--wind-direction) WIND_ARGS="$WIND_ARGS --wind-direction $2"; shift 2;;
+		--gust-intensity) WIND_ARGS="$WIND_ARGS --gust-intensity $2"; shift 2;;
+		--turbulence)     WIND_ARGS="$WIND_ARGS --turbulence $2"; shift 2;;
+		*) POSITIONAL+=("$1"); shift;;
+	esac
+done
+set -- "${POSITIONAL[@]}"
 
 while getopts n:m:d:M:s: option; do
 	case "${option}" in
@@ -83,6 +114,10 @@ python3 "$crazysim_dir/crazysim.py" \
 	--port 19950 \
 	--vis \
 	--dt "${dt}" \
+	${SENSOR_NOISE} \
+	${GROUND_EFFECT} \
+	${DOWNWASH} \
+	${WIND_ARGS} \
 	${mass_arg} \
 	${scene_arg} \
 	-- ${spawn_args}

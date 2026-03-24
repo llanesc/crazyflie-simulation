@@ -64,7 +64,7 @@ import struct
 import threading
 import time
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mujoco
 import mujoco.viewer
@@ -138,6 +138,7 @@ class MotorParams:
     diaginertia:     tuple[float, float, float]  # Ixx, Iyy, Izz [kg·m²]
     drag_matrix:     np.ndarray  # 3×3 aerodynamic drag matrix [N·s/m]
     prop_inertia:    float       # single propeller inertia [kg·m²]
+    prop_radius:     float       # propeller radius [m]
 
 
 def _max_rpm(rpm2thrust: tuple[float, float, float], thrust_max: float) -> float:
@@ -172,6 +173,7 @@ def _load_motor_params() -> dict[str, MotorParams]:
             diaginertia=(J[0][0], J[1][1], J[2][2]),
             drag_matrix=drag_matrix,
             prop_inertia=prop_inertia,
+            prop_radius=float(p['prop_radius']),
         )
     return result
 
@@ -251,6 +253,197 @@ def make_range_packet(front: float, back: float, left: float,
     """Pack multi-ranger CRTP packet (22 bytes total)."""
     payload = struct.pack('<Bfffff', SENSOR_RANGE, front, back, left, right, up)
     return bytes([CRTP_HDR_SIM]) + payload   # 1 + 21 = 22 bytes
+
+
+
+# ---------------------------------------------------------------------------
+# Sensor Noise Model
+# ---------------------------------------------------------------------------
+# BMI088 datasheet (BST-BMI088-DS001) noise, bias, and scale specs.
+# Bias and scale are randomized per instance to simulate unit-to-unit variation.
+_BMI088 = {
+    # White noise density
+    'acc_noise_density': [0.00157, 0.00157, 0.00186],  # m/s²/√Hz [X,Y,Z] (160,160,190 µg/√Hz)
+    'gyro_noise_density': 0.000244,                     # rad/s/√Hz (0.014 °/s/√Hz)
+    # Bias random walk (Allan variance, 5min static, real CF2.1)
+    'acc_bias_walk': 0.000001,     # m/s²/√s
+    'gyro_bias_walk': 0.0000013,   # rad/s/√s
+    # Zero offset ranges (datasheet)
+    'acc_offset_mg': 20.0,         # ±20 mg zero-g offset
+    'gyro_offset_dps': 1.0,        # ±1 °/s zero-rate offset
+    # Scale/sensitivity tolerance (datasheet)
+    'gyro_scale_pct': 1.0,         # ±1% sensitivity tolerance
+    # Barometer
+    'baro_noise_std': 0.1,         # m
+}
+
+
+class SensorNoiseModel:
+    """BMI088 sensor model: output = scale * true + bias + noise + walk.
+
+    Bias and scale are randomized at construction to simulate unit-to-unit
+    variation within datasheet tolerances.
+    """
+
+    def __init__(self, dt: float = 0.001):
+        cfg = _BMI088
+        # Noise density (per-axis)
+        acc_nd = cfg['acc_noise_density']
+        self._acc_nd = np.array(acc_nd) if isinstance(acc_nd, list) else np.full(3, acc_nd)
+        gyro_nd = cfg['gyro_noise_density']
+        self._gyro_nd = np.array(gyro_nd) if isinstance(gyro_nd, list) else np.full(3, gyro_nd)
+        # Bias random walk
+        self._acc_bw = cfg['acc_bias_walk']
+        self._gyro_bw = cfg['gyro_bias_walk']
+        self._baro_std = cfg['baro_noise_std']
+        self._dt = dt
+        self._sqrt_dt = math.sqrt(dt)
+        # Fixed bias — randomized at startup from datasheet offset range
+        acc_bias_max = cfg['acc_offset_mg'] * 1e-3 * 9.81  # mg → m/s²
+        gyro_bias_max = cfg['gyro_offset_dps'] * math.pi / 180.0  # °/s → rad/s
+        self._acc_bias_fixed = np.random.uniform(-acc_bias_max, acc_bias_max, 3)
+        self._gyro_bias_fixed = np.random.uniform(-gyro_bias_max, gyro_bias_max, 3)
+        # Scale factor — randomized at startup from datasheet tolerance
+        gyro_scale_err = cfg['gyro_scale_pct'] / 100.0
+        self._acc_scale = np.ones(3)  # accel scale tolerance negligible (0.002%/K)
+        self._gyro_scale = 1.0 + np.random.uniform(-gyro_scale_err, gyro_scale_err, 3)
+        # Wandering bias (starts at zero, drifts over time)
+        self._acc_bias_walk = np.zeros(3)
+        self._gyro_bias_walk = np.zeros(3)
+
+        print(f'[sensor] acc  bias: [{self._acc_bias_fixed[0]:+.4f}, '
+              f'{self._acc_bias_fixed[1]:+.4f}, {self._acc_bias_fixed[2]:+.4f}] m/s²')
+        print(f'[sensor] gyro bias: [{self._gyro_bias_fixed[0]*180/math.pi:+.4f}, '
+              f'{self._gyro_bias_fixed[1]*180/math.pi:+.4f}, '
+              f'{self._gyro_bias_fixed[2]*180/math.pi:+.4f}] °/s')
+        print(f'[sensor] gyro scale: [{self._gyro_scale[0]:.4f}, '
+              f'{self._gyro_scale[1]:.4f}, {self._gyro_scale[2]:.4f}]')
+
+    def apply_imu_noise(self, acc: np.ndarray, gyro: np.ndarray) -> tuple:
+        """Apply sensor model: output = scale * true + bias + noise + walk."""
+        # Bias walk
+        self._acc_bias_walk += np.random.normal(0, self._acc_bw * self._sqrt_dt, 3)
+        self._gyro_bias_walk += np.random.normal(0, self._gyro_bw * self._sqrt_dt, 3)
+        # White noise
+        acc_noise = np.random.normal(0, 1, 3) * self._acc_nd * self._sqrt_dt
+        gyro_noise = np.random.normal(0, 1, 3) * self._gyro_nd * self._sqrt_dt
+        # Full model
+        acc_out = self._acc_scale * acc + self._acc_bias_fixed + self._acc_bias_walk + acc_noise
+        gyro_out = self._gyro_scale * gyro + self._gyro_bias_fixed + self._gyro_bias_walk + gyro_noise
+        return acc_out, gyro_out
+
+    def apply_baro_noise(self, alt_m: float) -> float:
+        """Add Gaussian noise to barometer altitude reading."""
+        return alt_m + np.random.normal(0, self._baro_std)
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Wind & Turbulence Model
+# ---------------------------------------------------------------------------
+# Dryden turbulence intensity presets (sigma_w at low altitude) [m/s]
+_TURBULENCE_SIGMA = {'none': 0.0, 'light': 0.5, 'moderate': 1.5, 'severe': 3.0}
+
+
+class WindModel:
+    """Constant wind + Ornstein-Uhlenbeck gusts + Dryden turbulence."""
+
+    def __init__(self, speed: float = 0.0, direction_deg: float = 0.0,
+                 gust_intensity: float = 0.0, turbulence: str = 'none',
+                 dt: float = 0.001):
+        rad = math.radians(direction_deg)
+        self._const_wind = np.array([speed * math.cos(rad),
+                                     speed * math.sin(rad), 0.0])
+        self._gust_intensity = gust_intensity
+        self._gust_tau = 4.0  # correlation time [s]
+        self._gust_state = np.zeros(3)
+        self._turb_sigma = _TURBULENCE_SIGMA.get(turbulence, 0.0)
+        self._turb_state = np.zeros(3)
+        self._turb_tau = 5.0  # Dryden length-scale / airspeed proxy [s]
+        self._dt = dt
+        self._sqrt_dt = math.sqrt(dt)
+
+    def get_wind_velocity(self, pos: np.ndarray, t: float) -> np.ndarray:
+        """Return 3D wind velocity in world frame at (pos, t)."""
+        wind = self._const_wind.copy()
+        # Ornstein-Uhlenbeck gust process
+        if self._gust_intensity > 0:
+            alpha = self._dt / self._gust_tau
+            self._gust_state *= (1.0 - alpha)
+            self._gust_state += math.sqrt(2.0 * alpha) * self._gust_intensity * \
+                np.random.normal(0, 1, 3)
+            wind += self._gust_state
+        # Dryden turbulence (simplified first-order shaping filter)
+        if self._turb_sigma > 0:
+            alpha = self._dt / self._turb_tau
+            self._turb_state *= (1.0 - alpha)
+            self._turb_state += math.sqrt(2.0 * alpha) * self._turb_sigma * \
+                np.random.normal(0, 1, 3)
+            wind += self._turb_state
+        return wind
+
+
+# ---------------------------------------------------------------------------
+# Camera Renderer — pushes raw frames to crazysim_cpx.py via UDP
+# ---------------------------------------------------------------------------
+CAM_FRAME_BASE_PORT = 5200  # internal frame-push port (agent N uses +N)
+CAM_FRAME_CHUNK = 60000     # UDP payload limit (~64KB, stay under)
+
+
+class CameraRenderer:
+    """Offscreen FPV camera that pushes raw grayscale frames via UDP
+    to ``crazysim_cpx.py``, which wraps them in CPX and serves to cflib.
+
+    Frames are split into numbered UDP chunks so they fit in datagrams.
+    Chunk format: [seq:u16][total:u16][width:u16][height:u16][data]
+    """
+
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
+                 agent_id: int, width: int = 324, height: int = 244,
+                 fps: float = 20.0, cam_port: int | None = None):
+        self._cam_name = f'cf{agent_id}_fpv_cam'
+        self._cam_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA,
+                                          self._cam_name)
+        if self._cam_id < 0:
+            raise ValueError(f'Camera {self._cam_name!r} not found in model')
+        self._renderer = mujoco.Renderer(model, height=height, width=width)
+        self._width = width
+        self._height = height
+        self._frame_period = 1.0 / fps
+        self._acc = 0.0
+
+        self._port = cam_port if cam_port is not None else CAM_FRAME_BASE_PORT + agent_id
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._dest = ('127.0.0.1', self._port)
+        print(f'[crazysim] Agent {agent_id}: camera frames → '
+              f'udp://127.0.0.1:{self._port}')
+
+    def maybe_render(self, model: mujoco.MjModel, data: mujoco.MjData,
+                     dt: float):
+        self._acc += dt
+        if self._acc < self._frame_period:
+            return
+        self._acc -= self._frame_period
+
+        self._renderer.update_scene(data, camera=self._cam_name)
+        pixels = self._renderer.render()
+        gray = np.dot(pixels[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+        img_bytes = gray.tobytes()
+
+        # Split into UDP chunks
+        total = (len(img_bytes) + CAM_FRAME_CHUNK - 1) // CAM_FRAME_CHUNK
+        for seq in range(total):
+            offset = seq * CAM_FRAME_CHUNK
+            chunk = img_bytes[offset:offset + CAM_FRAME_CHUNK]
+            header = struct.pack('<HHHH', seq, total, self._width, self._height)
+            try:
+                self._sock.sendto(header + chunk, self._dest)
+            except OSError:
+                pass
+
+    def stop(self):
+        self._sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +646,11 @@ class DroneAgent:
 
     def __init__(self, agent_id: int, model: mujoco.MjModel, data: mujoco.MjData,
                  params: MotorParams, host: str, fw_port: int,
-                 cflib_port: int, dt: float):
+                 cflib_port: int, dt: float, *,
+                 noise_model: SensorNoiseModel | None = None,
+                 wind_model: WindModel | None = None,
+                 ground_effect: bool = False,
+                 camera_renderer: CameraRenderer | None = None):
         self.agent_id = agent_id
         self.model = model
         self.data = data
@@ -535,6 +732,13 @@ class DroneAgent:
         self._cflib_to_firmware_q = queue.Queue(maxsize=20)
 
         self._running = False
+
+        # Optional feature models
+        self._noise_model = noise_model
+        self._wind_model = wind_model
+        self._ground_effect = ground_effect
+        self._camera = camera_renderer
+
         print(f'[crazysim] Agent {agent_id}: fw_port={fw_port}  cflib_port={cflib_port}')
 
     def _pwm_to_rpm(self, pwm: int) -> float:
@@ -650,6 +854,24 @@ class DroneAgent:
                 except OSError:
                     pass
 
+    def _compute_ground_effect(self) -> float:
+        """Cheeseman-Bennett ground effect: thrust multiplier >= 1.0."""
+        bid = self._body_id
+        pos = self.data.xpos[bid]
+        R = self.data.xmat[bid].reshape(3, 3)
+        d_world = R @ np.array([0.0, 0.0, -1.0])
+        geom_id = np.array([-1], dtype=np.int32)
+        z = mujoco.mj_ray(
+            self.model, self.data,
+            pos, d_world,
+            self._ray_geomgroup, 1, bid, geom_id,
+        )
+        pr = self._params.prop_radius
+        if z < 0 or z > 4.0 * pr:
+            return 1.0
+        ratio = pr / (4.0 * max(z, 0.005))
+        return 1.0 / (1.0 - ratio * ratio)
+
     def update_motors(self):
         p = self._params
         with self._motor_lock:
@@ -657,6 +879,8 @@ class DroneAgent:
 
         a_t, b_t, c_t = p.rpm2thrust
         a_q, b_q, c_q = p.rpm2torque
+
+        ge_factor = self._compute_ground_effect() if self._ground_effect else 1.0
 
         rpm_prev = self._rpm.copy()
         for i in range(4):
@@ -666,7 +890,7 @@ class DroneAgent:
 
             rpm = self._rpm[i]
             thrust = a_t + b_t * rpm + c_t * rpm * rpm
-            thrust = max(thrust, 0.0)
+            thrust = max(thrust, 0.0) * ge_factor
             drag_torque = MOTOR_DIR[i] * (a_q + b_q * rpm + c_q * rpm * rpm)
 
             self.data.ctrl[self._act_force[i]] = thrust
@@ -696,8 +920,14 @@ class DroneAgent:
         R = self.data.xmat[bid].reshape(3, 3)
         lin_vel_world = self.data.qvel[adr:adr + 3]
 
-        # Aerodynamic drag: velocity to body frame, apply drag, back to world
-        v_body = R.T @ lin_vel_world
+        # Aerodynamic drag: use airspeed (body vel - wind) if wind model active
+        if self._wind_model is not None:
+            wind_world = self._wind_model.get_wind_velocity(
+                self.data.xpos[bid], self.data.time)
+            v_rel_world = lin_vel_world - wind_world
+        else:
+            v_rel_world = lin_vel_world
+        v_body = R.T @ v_rel_world
         f_drag_body = p.drag_matrix @ v_body
         f_drag_world = R @ f_drag_body
 
@@ -769,6 +999,10 @@ class DroneAgent:
         acc, gyro = self.read_imu()
         pos, quat = self.read_pose()
 
+        # Apply sensor noise if enabled
+        if self._noise_model is not None:
+            acc, gyro = self._noise_model.apply_imu_noise(acc, gyro)
+
         self._sock.sendto(make_imu_packet(acc, gyro), self._firmware_addr)
         self._sock.sendto(make_pose_packet(pos, quat), self._firmware_addr)
 
@@ -776,7 +1010,10 @@ class DroneAgent:
         self._baro_acc += self.dt
         if self._baro_acc >= baro_period:
             self._baro_acc -= baro_period
-            self._sock.sendto(make_baro_packet(pos[2]), self._firmware_addr)
+            alt = pos[2]
+            if self._noise_model is not None:
+                alt = self._noise_model.apply_baro_noise(alt)
+            self._sock.sendto(make_baro_packet(alt), self._firmware_addr)
 
         # Multi-ranger at RANGE_RATE_HZ
         range_period = 1.0 / RANGE_RATE_HZ
@@ -786,6 +1023,11 @@ class DroneAgent:
             front, back, left, right, up = self.read_ranges()
             self._sock.sendto(make_range_packet(front, back, left, right, up),
                               self._firmware_addr)
+
+
+        # Camera rendering (must be called from main/physics thread)
+        if self._camera is not None:
+            self._camera.maybe_render(self.model, self.data, self.dt)
 
         # Drain cflib→firmware queue
         while not self._cflib_to_firmware_q.empty():
@@ -847,11 +1089,20 @@ class CrazySimMuJoCo:
     def __init__(self, model_path: str, host: str, base_port: int,
                  spawn_positions: list[tuple[float, float]],
                  visualize: bool = False, timestep: float = 0.001,
-                 model_type: str = DEFAULT_MODEL_TYPE):
+                 model_type: str = DEFAULT_MODEL_TYPE, *,
+                 noise_model: SensorNoiseModel | None = None,
+                 wind_model: WindModel | None = None,
+                 ground_effect: bool = False,
+                 downwash: bool = False,
+                 camera_enabled: bool = False,
+                 cam_width: int = 324, cam_height: int = 244,
+                 cam_fps: float = 20.0,
+                 cam_port: int | None = None):
         self.host = host
         self.visualize = visualize
         self.dt = timestep
         self.num_agents = len(spawn_positions)
+        self._downwash = downwash
 
         if model_type not in MOTOR_PARAMS:
             raise ValueError(f'Unknown model_type {model_type!r}. '
@@ -867,6 +1118,21 @@ class CrazySimMuJoCo:
         print(f'[crazysim] mass       : {params.mass:.4f} kg')
         print(f'[crazysim] diaginertia: {params.diaginertia}')
 
+        # Print enabled features
+        features = []
+        if noise_model is not None:
+            features.append('sensor-noise')
+        if wind_model is not None:
+            features.append('wind')
+        if ground_effect:
+            features.append('ground-effect')
+        if downwash:
+            features.append('downwash')
+        if camera_enabled:
+            features.append('camera')
+        if features:
+            print(f'[crazysim] features   : {", ".join(features)}')
+
         # Build shared MuJoCo model with all drones
         self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
         self.model.opt.timestep = self.dt
@@ -877,6 +1143,15 @@ class CrazySimMuJoCo:
         for i in range(self.num_agents):
             fw_port = base_port + i
             cflib_port = fw_port + CFLIB_PORT_OFFSET
+            # Per-agent noise and battery (independent state per drone)
+            agent_noise = SensorNoiseModel(
+                dt=self.dt,
+            ) if noise_model is not None else None
+            agent_camera = CameraRenderer(
+                self.model, self.data, i,
+                width=cam_width, height=cam_height, fps=cam_fps,
+                cam_port=cam_port + i if cam_port is not None else None,
+            ) if camera_enabled else None
             agent = DroneAgent(
                 agent_id=i,
                 model=self.model,
@@ -886,10 +1161,40 @@ class CrazySimMuJoCo:
                 fw_port=fw_port,
                 cflib_port=cflib_port,
                 dt=self.dt,
+                noise_model=agent_noise,
+                wind_model=wind_model,  # shared across agents (stateless reads)
+                ground_effect=ground_effect,
+                camera_renderer=agent_camera,
             )
             self.agents.append(agent)
 
         self._running = False
+
+    def _apply_downwash(self):
+        """Apply downwash force perturbations between drones."""
+        for i, agent_below in enumerate(self.agents):
+            for j, agent_above in enumerate(self.agents):
+                if i == j:
+                    continue
+                dx = self.data.xpos[agent_below._body_id] - \
+                    self.data.xpos[agent_above._body_id]
+                horiz_dist = math.sqrt(dx[0]**2 + dx[1]**2)
+                vert_dist = dx[2]  # positive means below is higher (wrong)
+                if vert_dist > 0 or vert_dist < -2.0:
+                    continue  # above is below or too far
+                if horiz_dist > 0.3:
+                    continue
+                avg_rpm = float(np.mean(agent_above._rpm))
+                if avg_rpm < 100:
+                    continue
+                intensity = (avg_rpm / agent_above._params.max_rpm) * \
+                    math.exp(-horiz_dist / 0.1) / max(abs(vert_dist), 0.05)
+                adr = agent_below._qvel_adr
+                self.data.qfrc_applied[adr:adr + 3] += np.array([
+                    np.random.normal(0, 0.002 * intensity),
+                    np.random.normal(0, 0.002 * intensity),
+                    -0.005 * intensity,
+                ])
 
     def run(self):
         # Handshake all agents (in parallel threads to avoid blocking)
@@ -911,6 +1216,8 @@ class CrazySimMuJoCo:
                 agent.update_motors()
                 agent.apply_aero_effects()
                 agent.update_led_materials()
+            if self._downwash and self.num_agents > 1:
+                self._apply_downwash()
             mujoco.mj_step(self.model, self.data)
             for agent in self.agents:
                 agent.send_sensor_data()
@@ -1048,6 +1355,33 @@ def main():
                    help='Override drone mass [kg]')
     p.add_argument('--scene', default=None,
                    help='Path to scene MJCF XML (default: scene.xml)')
+    # --- Feature flags ---
+    p.add_argument('--sensor-noise', action='store_true',
+                   help='Enable sensor noise model (IMU + baro)')
+    p.add_argument('--wind-speed', type=float, default=0.0,
+                   help='Constant wind speed [m/s]')
+    p.add_argument('--wind-direction', type=float, default=0.0,
+                   help='Wind direction [deg], 0=+X, 90=+Y')
+    p.add_argument('--gust-intensity', type=float, default=0.0,
+                   help='Gust peak deviation [m/s]')
+    p.add_argument('--turbulence', choices=['none', 'light', 'moderate', 'severe'],
+                   default='none', help='Dryden turbulence level')
+    p.add_argument('--ground-effect', action='store_true',
+                   help='Enable Cheeseman-Bennett ground effect model')
+    p.add_argument('--downwash', action='store_true',
+                   help='Enable inter-drone downwash interaction')
+    p.add_argument('--camera', action='store_true',
+                   help='Enable AI-deck camera (CPX WiFi streaming on TCP)')
+    p.add_argument('--cam-width', type=int, default=324,
+                   help='Camera image width [px] (default: 324, matches AI-deck)')
+    p.add_argument('--cam-height', type=int, default=244,
+                   help='Camera image height [px] (default: 244, matches AI-deck)')
+    p.add_argument('--cam-fps', type=float, default=20.0,
+                   help='Camera frame rate [Hz] (default: 20)')
+    p.add_argument('--cam-port', type=int, default=None,
+                   help='Base TCP port for internal frame server '
+                        '(default: 5100, agent N uses port+N). '
+                        'Use crazysim_cpx.py to bridge to CPX clients.')
     args = p.parse_args()
 
     # Override scene XML if provided
@@ -1086,6 +1420,19 @@ def main():
     # Parse spawn positions
     spawn_positions = _parse_spawn_positions(args.agents, args.spawn_file)
 
+    # Build optional feature models
+    noise_model = SensorNoiseModel(
+        dt=args.dt,
+    ) if args.sensor_noise else None
+
+    wind_active = (args.wind_speed > 0 or args.gust_intensity > 0
+                   or args.turbulence != 'none')
+    wind_model = WindModel(
+        speed=args.wind_speed, direction_deg=args.wind_direction,
+        gust_intensity=args.gust_intensity, turbulence=args.turbulence,
+        dt=args.dt,
+    ) if wind_active else None
+
     CrazySimMuJoCo(
         model_path=model_path,
         host=args.host,
@@ -1094,6 +1441,15 @@ def main():
         visualize=args.vis,
         timestep=args.dt,
         model_type=model_type,
+        noise_model=noise_model,
+        wind_model=wind_model,
+        ground_effect=args.ground_effect,
+        downwash=args.downwash,
+        camera_enabled=args.camera,
+        cam_width=args.cam_width,
+        cam_height=args.cam_height,
+        cam_fps=args.cam_fps,
+        cam_port=args.cam_port,
     ).run()
 
 

@@ -177,23 +177,13 @@ class CrazySimCPX:
 
                 if func == CPX_F_CRTP:
                     # Forward raw CRTP data to firmware via cflib UDP port
-                    crtp_hdr = data[0] if len(data) > 0 else 0
-                    crtp_port = (crtp_hdr >> 4) & 0x0F
-                    crtp_ch = crtp_hdr & 0x03
-                    print(f'[cpx] TX CRTP → fw: port={crtp_port} ch={crtp_ch} '
-                          f'len={len(data)} data={data[:8].hex()}')
                     self._crtp_sock.sendto(data, self._crtp_addr)
 
                 elif func == CPX_F_SYSTEM:
-                    print(f'[cpx] RX SYSTEM: data={data.hex()}')
-                    pass
+                    pass  # bridge enable etc. — not needed in sim
 
                 elif func == CPX_F_WIFI_CTRL:
-                    print(f'[cpx] RX WIFI_CTRL: data={data.hex()}')
-                    pass
-
-                else:
-                    print(f'[cpx] RX unknown func={func} len={len(data)}')
+                    pass  # WiFi setup — not needed in sim
 
         except (ConnectionError, OSError):
             pass
@@ -236,19 +226,11 @@ class CrazySimCPX:
 
             # Skip cflib passthrough handshake echoes
             if len(data) == 1 and data[0] == 0xFF:
-                print(f'[cpx] RX UDP: handshake echo, skipping')
                 continue
-
-            crtp_hdr = data[0] if len(data) > 0 else 0
-            crtp_port = (crtp_hdr >> 4) & 0x0F
-            crtp_ch = crtp_hdr & 0x03
-            print(f'[cpx] RX CRTP ← fw: port={crtp_port} ch={crtp_ch} '
-                  f'len={len(data)} data={data[:8].hex()}')
 
             with self._cpx_lock:
                 client = self._cpx_client
             if client is None:
-                print(f'[cpx] RX CRTP ← fw: no client, dropped')
                 continue
 
             pkt = cpx_build(CPX_T_STM32, CPX_T_HOST, CPX_F_CRTP,
@@ -256,7 +238,7 @@ class CrazySimCPX:
             try:
                 client.sendall(pkt)
             except (BrokenPipeError, ConnectionResetError, OSError):
-                print(f'[cpx] RX CRTP ← fw: send to client failed')
+                pass
 
     # ------------------------------------------------------------------
     # Camera frames (UDP) → CPX APP packets (TCP)

@@ -83,6 +83,8 @@ CRTP_HDR_LOC     = (CRTP_PORT_LOC << 4) | (1 << 2) | 1  # 0x65
 SENSOR_GYRO_ACC  = 0
 SENSOR_BARO      = 2
 SENSOR_RANGE     = 3
+SENSOR_TOF       = 5
+SENSOR_FLOW      = 6
 GEN_LOC_EXT_POSE = 0x08
 
 # LSB conversion factors (firmware sensors_sitl.c)
@@ -105,6 +107,10 @@ M_AIR    = 0.0289644
 BARO_RATE_HZ = 50
 RANGE_RATE_HZ = 10         # Multi-ranger update rate (matches real hardware)
 RANGE_MAX_M   = 4.0        # VL53L1x max range [m]
+FLOW_RATE_HZ  = 100        # PMW3901 flow sensor update rate
+TOF_RATE_HZ   = 40         # VL53L1x ToF update rate (flowdeck)
+FLOW_NPIX     = 30.0       # PMW3901 pixel count
+FLOW_THETAPIX = 4.2 * math.pi / 180.0  # FOV per pixel [rad]
 CFLIB_PORT_OFFSET = -100   # cflib port = firmware port + offset (19950 → 19850)
 
 # ---------------------------------------------------------------------------
@@ -254,6 +260,17 @@ def make_range_packet(front: float, back: float, left: float,
     payload = struct.pack('<Bfffff', SENSOR_RANGE, front, back, left, right, up)
     return bytes([CRTP_HDR_SIM]) + payload   # 1 + 21 = 22 bytes
 
+
+def make_tof_packet(distance: float) -> bytes:
+    """Pack TOF (downward rangefinder) CRTP packet."""
+    payload = struct.pack('<Bf', SENSOR_TOF, distance)
+    return bytes([CRTP_HDR_SIM]) + payload   # 1 + 5 = 6 bytes
+
+
+def make_flow_packet(dpixelx: float, dpixely: float, dt: float) -> bytes:
+    """Pack optical flow CRTP packet (dpixelx, dpixely, dt)."""
+    payload = struct.pack('<Bfff', SENSOR_FLOW, dpixelx, dpixely, dt)
+    return bytes([CRTP_HDR_SIM]) + payload   # 1 + 13 = 14 bytes
 
 
 # ---------------------------------------------------------------------------
@@ -650,7 +667,8 @@ class DroneAgent:
                  noise_model: SensorNoiseModel | None = None,
                  wind_model: WindModel | None = None,
                  ground_effect: bool = False,
-                 camera_renderer: CameraRenderer | None = None):
+                 camera_renderer: CameraRenderer | None = None,
+                 flowdeck: bool = False):
         self.agent_id = agent_id
         self.model = model
         self.data = data
@@ -706,6 +724,12 @@ class DroneAgent:
             model, mujoco.mjtObj.mjOBJ_LIGHT, f'{prefix}led_bot_light')
         self._headlight_light_id = mujoco.mj_name2id(
             model, mujoco.mjtObj.mjOBJ_LIGHT, f'{prefix}headlight_light')
+
+        # Flowdeck
+        self._flowdeck = flowdeck
+        self._flow_acc = 0.0
+        self._tof_acc = 0.0
+        self._last_flow_time = 0.0
 
         # Baro accumulator
         self._baro_acc = 0.0
@@ -993,6 +1017,56 @@ class DroneAgent:
 
         return tuple(ranges)
 
+    def read_tof_down(self) -> float:
+        """Cast a ray downward in body frame, return distance [m]."""
+        bid = self._body_id
+        pos = self.data.xpos[bid]
+        R = self.data.xmat[bid].reshape(3, 3)
+        d_world = R @ np.array([0.0, 0.0, -1.0])
+        geom_id = np.array([-1], dtype=np.int32)
+        dist = mujoco.mj_ray(
+            self.model, self.data, pos, d_world,
+            self._ray_geomgroup, 1, bid, geom_id,
+        )
+        if dist < 0 or dist > RANGE_MAX_M:
+            dist = RANGE_MAX_M
+        return dist
+
+    def compute_flow(self) -> tuple[float, float, float]:
+        """Compute optical flow dpixel_x, dpixel_y, dt from body state."""
+        bid = self._body_id
+        R = self.data.xmat[bid].reshape(3, 3)
+
+        # Body velocity (world frame) → body frame
+        vel_world = self.data.cvel[bid][3:6]  # linear velocity
+        vel_body = R.T @ vel_world
+
+        # Angular velocity in body frame
+        omega_body = R.T @ self.data.cvel[bid][0:3]
+
+        # Height above ground from TOF
+        height = self.read_tof_down()
+        if height < 0.1:
+            height = 0.1
+
+        # cos(tilt) = R[2,2] (body Z dot world Z)
+        cos_tilt = R[2, 2]
+
+        dt = 1.0 / FLOW_RATE_HZ
+        scale = dt * FLOW_NPIX / FLOW_THETAPIX
+        omega_factor = 1.25
+
+        dpixelx = scale * (vel_body[0] / height * cos_tilt - omega_factor * omega_body[1])
+        dpixely = scale * (vel_body[1] / height * cos_tilt + omega_factor * omega_body[0])
+
+        # Simulated noise — lower than real PMW3901 (stdDev=2.0) because
+        # MuJoCo ground plane has no surface-texture or lighting variance.
+        # Firmware-side stdDev stays at 2.0 to match real hardware tuning.
+        dpixelx += np.random.normal(0, 0.5)
+        dpixely += np.random.normal(0, 0.5)
+
+        return dpixelx, dpixely, dt
+
     def send_sensor_data(self):
         if not self._firmware_addr:
             return
@@ -1004,7 +1078,10 @@ class DroneAgent:
             acc, gyro = self._noise_model.apply_imu_noise(acc, gyro)
 
         self._sock.sendto(make_imu_packet(acc, gyro), self._firmware_addr)
-        self._sock.sendto(make_pose_packet(pos, quat), self._firmware_addr)
+
+        # Send pose only when NOT using flowdeck
+        if not self._flowdeck:
+            self._sock.sendto(make_pose_packet(pos, quat), self._firmware_addr)
 
         baro_period = 1.0 / BARO_RATE_HZ
         self._baro_acc += self.dt
@@ -1024,6 +1101,22 @@ class DroneAgent:
             self._sock.sendto(make_range_packet(front, back, left, right, up),
                               self._firmware_addr)
 
+        # Flowdeck: TOF + optical flow
+        if self._flowdeck:
+            tof_period = 1.0 / TOF_RATE_HZ
+            self._tof_acc += self.dt
+            if self._tof_acc >= tof_period:
+                self._tof_acc -= tof_period
+                dist = self.read_tof_down()
+                self._sock.sendto(make_tof_packet(dist), self._firmware_addr)
+
+            flow_period = 1.0 / FLOW_RATE_HZ
+            self._flow_acc += self.dt
+            if self._flow_acc >= flow_period:
+                self._flow_acc -= flow_period
+                dpx, dpy, fdt = self.compute_flow()
+                self._sock.sendto(make_flow_packet(dpx, dpy, fdt),
+                                  self._firmware_addr)
 
         # Camera rendering (must be called from main/physics thread)
         if self._camera is not None:
@@ -1093,6 +1186,7 @@ class CrazySimMuJoCo:
                  noise_model: SensorNoiseModel | None = None,
                  wind_model: WindModel | None = None,
                  ground_effect: bool = False,
+                 flowdeck: bool = False,
                  downwash: bool = False,
                  camera_enabled: bool = False,
                  cam_width: int = 324, cam_height: int = 244,
@@ -1103,6 +1197,7 @@ class CrazySimMuJoCo:
         self.dt = timestep
         self.num_agents = len(spawn_positions)
         self._downwash = downwash
+        self._flowdeck = flowdeck
 
         if model_type not in MOTOR_PARAMS:
             raise ValueError(f'Unknown model_type {model_type!r}. '
@@ -1165,6 +1260,7 @@ class CrazySimMuJoCo:
                 wind_model=wind_model,  # shared across agents (stateless reads)
                 ground_effect=ground_effect,
                 camera_renderer=agent_camera,
+                flowdeck=flowdeck,
             )
             self.agents.append(agent)
 
@@ -1366,6 +1462,8 @@ def main():
                    help='Gust peak deviation [m/s]')
     p.add_argument('--turbulence', choices=['none', 'light', 'moderate', 'severe'],
                    default='none', help='Dryden turbulence level')
+    p.add_argument('--flowdeck', action='store_true',
+                   help='Simulate flowdeck (TOF + optical flow, disables pose)')
     p.add_argument('--ground-effect', action='store_true',
                    help='Enable Cheeseman-Bennett ground effect model')
     p.add_argument('--downwash', action='store_true',
@@ -1444,6 +1542,7 @@ def main():
         noise_model=noise_model,
         wind_model=wind_model,
         ground_effect=args.ground_effect,
+        flowdeck=args.flowdeck,
         downwash=args.downwash,
         camera_enabled=args.camera,
         cam_width=args.cam_width,

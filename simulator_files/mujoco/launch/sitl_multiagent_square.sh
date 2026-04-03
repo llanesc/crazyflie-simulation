@@ -2,7 +2,8 @@
 # Launch multiple Crazyflie SITL agents in a square formation with MuJoCo.
 #
 # Usage: ./sitl_multiagent_square.sh [-n <num_vehicles>] [-m <model_type>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]
-#        [--sensor-noise] [--ground-effect] [--downwash] [--wind-speed <m/s>] [--turbulence <level>]
+#        [--sensor-noise] [--ground-effect] [--downwash] [--flowdeck]
+#        [--wind-speed <m/s>] [--turbulence <level>]
 #
 # This starts N cf2 firmware instances (ports 19950..19950+N-1) and one
 # crazysim.py process with all drones in a single MuJoCo world.
@@ -14,7 +15,8 @@ function cleanup() {
 if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "Description: Launch multiple Crazyflie SITL agents in a square formation in MuJoCo."
 	echo "Usage: $0 [-n <num_vehicles>] [-m <model_type>] [-d <dt>] [-M <mass_kg>] [-s <scene_xml>]"
-	echo "          [--sensor-noise] [--ground-effect] [--downwash] [--wind-speed <m/s>] [--turbulence <level>]"
+	echo "          [--sensor-noise] [--ground-effect] [--downwash] [--flowdeck]"
+	echo "          [--wind-speed <m/s>] [--turbulence <level>]"
 	echo ""
 	echo "Model types: cf2x_T350 (default), cf2x_L250, cf2x_P250, cf21B_500"
 	echo "Scene files: scene.xml (default), scene_obstacles.xml"
@@ -23,6 +25,7 @@ if [ "$1" == "-h" ] || [ "$1" == "--help" ]; then
 	echo "  --sensor-noise        BMI088 IMU noise model (bias, scale, white noise)"
 	echo "  --ground-effect       Increased thrust near ground"
 	echo "  --downwash            Aerodynamic interaction between drones"
+	echo "  --flowdeck            Simulate flowdeck (TOF + optical flow, disables pose)"
 	echo "  --wind-speed <m/s>    Constant wind speed"
 	echo "  --wind-direction <deg> Wind direction (0=+X, 90=+Y, 180=-X, 270=-Y)"
 	echo "  --gust-intensity <m/s> Random gust peak deviation"
@@ -34,6 +37,7 @@ fi
 SENSOR_NOISE=""
 GROUND_EFFECT=""
 DOWNWASH=""
+FLOWDECK=""
 WIND_ARGS=""
 POSITIONAL=()
 while [[ $# -gt 0 ]]; do
@@ -41,6 +45,7 @@ while [[ $# -gt 0 ]]; do
 		--sensor-noise)   SENSOR_NOISE="--sensor-noise"; shift;;
 		--ground-effect)  GROUND_EFFECT="--ground-effect"; shift;;
 		--downwash)       DOWNWASH="--downwash"; shift;;
+		--flowdeck)       FLOWDECK="--flowdeck"; shift;;
 		--wind-speed)     WIND_ARGS="$WIND_ARGS --wind-speed $2"; shift 2;;
 		--wind-direction) WIND_ARGS="$WIND_ARGS --wind-direction $2"; shift 2;;
 		--gust-intensity) WIND_ARGS="$WIND_ARGS --gust-intensity $2"; shift 2;;
@@ -92,7 +97,7 @@ while [ $n -lt $num_vehicles ]; do
 	[ ! -d "$working_dir" ] && mkdir -p "$working_dir"
 	pushd "$working_dir" &>/dev/null
 	echo "Starting firmware instance $n on port $((19950+$n)) at ($x_cord, $y_cord)"
-	$build_path/cf2 $((19950+${n})) > out.log 2> error.log &
+	stdbuf -oL $build_path/cf2 $((19950+${n})) > out.log 2> error.log &
 	popd &>/dev/null
 
 	n=$(($n + 1))
@@ -117,6 +122,7 @@ python3 "$crazysim_dir/crazysim.py" \
 	${SENSOR_NOISE} \
 	${GROUND_EFFECT} \
 	${DOWNWASH} \
+	${FLOWDECK} \
 	${WIND_ARGS} \
 	${mass_arg} \
 	${scene_arg} \

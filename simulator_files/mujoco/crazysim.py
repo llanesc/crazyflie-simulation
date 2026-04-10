@@ -70,6 +70,9 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
+# Rover dynamics (optional — only loaded if --rover-model is used)
+_ROVER_MODELS_DIR = os.path.join(os.path.dirname(__file__), 'rover-models')
+
 # ---------------------------------------------------------------------------
 # CRTP constants (CrtpUtils.h)
 # ---------------------------------------------------------------------------
@@ -145,6 +148,7 @@ class MotorParams:
     drag_matrix:     np.ndarray  # 3×3 aerodynamic drag matrix [N·s/m]
     prop_inertia:    float       # single propeller inertia [kg·m²]
     prop_radius:     float       # propeller radius [m]
+    L:               float       # arm length (center to rotor) [m]
 
 
 def _max_rpm(rpm2thrust: tuple[float, float, float], thrust_max: float) -> float:
@@ -180,6 +184,7 @@ def _load_motor_params() -> dict[str, MotorParams]:
             drag_matrix=drag_matrix,
             prop_inertia=prop_inertia,
             prop_radius=float(p['prop_radius']),
+            L=float(p['L']),
         )
     return result
 
@@ -503,15 +508,15 @@ def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
 
     # --- LED and headlight setup ---
 
-    # Make LED materials emissive so they glow in dark scenes
+    # LED materials — keep visual but disable emission to avoid lighting up other objects
     for mat_name in ('led_top', 'led_bot'):
         mat = spec.material(mat_name)
         if mat is not None:
-            mat.emission = 1.0
+            mat.emission = 0.0
 
-    # Add headlight material (emissive, initially transparent)
+    # Add headlight material (no emission)
     if spec.material('headlight') is None:
-        spec.add_material(name='headlight', rgba=[1.0, 1.0, 0.95, 0.0], emission=1.0)
+        spec.add_material(name='headlight', rgba=[1.0, 1.0, 0.95, 0.0], emission=0.0)
 
     # Add headlight geometry at front of PCB
     if spec.geom('headlight') is None:
@@ -570,9 +575,11 @@ def _patch_drone_spec(spec: mujoco.MjSpec, params: MotorParams) -> None:
 
 
 def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]],
-                      params: MotorParams) -> mujoco.MjSpec:
+                      params: MotorParams,
+                      rover_xml: str | None = None,
+                      rover_pos: tuple[float, float] = (0.0, 0.0)) -> mujoco.MjSpec:
     """
-    Combine scene.xml + N drone models using MjSpec.
+    Combine scene.xml + N drone models + optional rover using MjSpec.
     Each drone body is attached at a unique spawn position with a unique
     name prefix (cf0_, cf1_, ...) to avoid name collisions.
     """
@@ -588,17 +595,29 @@ def _build_spec_multi(drone_xml: str, spawn_positions: list[tuple[float, float]]
         attached = frame.attach_body(drone_spec.body('drone'), prefix, '')
         attached.add_freejoint()
 
+    # Attach rover if provided
+    if rover_xml is not None:
+        rover_spec = mujoco.MjSpec.from_file(rover_xml)
+        frame = scene_spec.worldbody.add_frame()
+        frame.pos = [rover_pos[0], rover_pos[1], 0.0]
+        attached = frame.attach_body(rover_spec.body('rover'), 'rover_', '')
+        attached.add_freejoint()
+        print(f'[crazysim] Rover attached at ({rover_pos[0]}, {rover_pos[1]})')
+
     return scene_spec
 
 
 def _build_spec_multi_safe(drone_xml: str, spawn_positions: list[tuple[float, float]],
-                           params: MotorParams) -> mujoco.MjModel:
+                           params: MotorParams,
+                           rover_xml: str | None = None,
+                           rover_pos: tuple[float, float] = (0.0, 0.0)) -> mujoco.MjModel:
     """
     Build multi-agent model. Falls back to mesh-stripped drone if STL assets
     are missing.
     """
     try:
-        return _build_spec_multi(drone_xml, spawn_positions, params).compile()
+        return _build_spec_multi(drone_xml, spawn_positions, params,
+                                 rover_xml=rover_xml, rover_pos=rover_pos).compile()
     except ValueError as exc:
         err = str(exc)
         if 'opening file' not in err and '.stl' not in err.lower():
@@ -755,6 +774,11 @@ class DroneAgent:
         self._firmware_to_cflib_q = queue.Queue(maxsize=20)
         self._cflib_to_firmware_q = queue.Queue(maxsize=20)
 
+        # Lock-free send queue: physics thread enqueues, sender thread drains
+        from collections import deque
+        self._send_q = deque()
+        self._sender_running = False
+
         self._running = False
 
         # Optional feature models
@@ -794,14 +818,36 @@ class DroneAgent:
 
     def start_threads(self):
         self._running = True
+        self._sender_running = True
         threading.Thread(target=self._recv_thread, daemon=True).start()
         threading.Thread(target=self._recv_cflib_thread, daemon=True).start()
         threading.Thread(target=self._send_cflib_thread, daemon=True).start()
+        threading.Thread(target=self._send_sensor_thread, daemon=True).start()
 
     def stop(self):
         self._running = False
+        self._sender_running = False
         self._sock.close()
         self._cflib_sock.close()
+
+    def _send_sensor_thread(self):
+        """Dedicated thread that drains _send_q and sends UDP packets.
+
+        Mirrors the Gazebo CrazySim sendCfFirmwareThread pattern:
+        physics thread enqueues packets, this thread does the I/O.
+        """
+        q = self._send_q
+        sock = self._sock
+        while self._sender_running:
+            # Drain all queued packets
+            while q:
+                try:
+                    pkt, addr = q.popleft()
+                    sock.sendto(pkt, addr)
+                except IndexError:
+                    break
+            # Brief yield to avoid busy-spinning when queue is empty
+            time.sleep(0.0001)
 
     def _recv_thread(self):
         while self._running:
@@ -878,23 +924,50 @@ class DroneAgent:
                 except OSError:
                     pass
 
-    def _compute_ground_effect(self) -> float:
-        """Cheeseman-Bennett ground effect: thrust multiplier >= 1.0."""
+    def _compute_ground_effect(self) -> np.ndarray:
+        """Per-rotor Cheeseman-Bennett ground effect matching Crazyflow training env.
+
+        Each rotor gets its own height-dependent thrust multiplier.
+        Uses MuJoCo ray cast per motor site for accurate surface detection.
+
+        Returns:
+            (4,) array of thrust multipliers >= 1.0 per motor.
+        """
         bid = self._body_id
         pos = self.data.xpos[bid]
         R = self.data.xmat[bid].reshape(3, 3)
-        d_world = R @ np.array([0.0, 0.0, -1.0])
-        geom_id = np.array([-1], dtype=np.int32)
-        z = mujoco.mj_ray(
-            self.model, self.data,
-            pos, d_world,
-            self._ray_geomgroup, 1, bid, geom_id,
-        )
         pr = self._params.prop_radius
-        if z < 0 or z > 4.0 * pr:
-            return 1.0
-        ratio = pr / (4.0 * max(z, 0.005))
-        return 1.0 / (1.0 - ratio * ratio)
+        ge_scale = 1.5  # match training env overestimate for sim-to-real robustness
+        L = self._params.L
+
+        # Motor positions in body frame (X-config)
+        motor_pos_body = np.array([
+            [L, -L, 0.0],   # motor0
+            [-L, -L, 0.0],  # motor1
+            [-L, L, 0.0],   # motor2
+            [L, L, 0.0],    # motor3
+        ])
+
+        d_world = np.array([0.0, 0.0, -1.0])  # ray direction: straight down
+        geom_id = np.array([-1], dtype=np.int32)
+        ge_factors = np.ones(4)
+
+        for i in range(4):
+            # Motor world position
+            motor_world = pos + R @ motor_pos_body[i]
+            z = mujoco.mj_ray(
+                self.model, self.data,
+                motor_world, d_world,
+                self._ray_geomgroup, 1, bid, geom_id,
+            )
+            if z < 0 or z > 4.0 * pr:
+                ge_factors[i] = 1.0
+            else:
+                z_eff = max(z, 0.01)
+                ratio = min(pr / (4.0 * z_eff), 0.9)
+                ge_factors[i] = ge_scale / (1.0 - ratio * ratio)
+
+        return ge_factors
 
     def update_motors(self):
         p = self._params
@@ -904,7 +977,7 @@ class DroneAgent:
         a_t, b_t, c_t = p.rpm2thrust
         a_q, b_q, c_q = p.rpm2torque
 
-        ge_factor = self._compute_ground_effect() if self._ground_effect else 1.0
+        ge_factors = self._compute_ground_effect() if self._ground_effect else np.ones(4)
 
         rpm_prev = self._rpm.copy()
         for i in range(4):
@@ -914,7 +987,7 @@ class DroneAgent:
 
             rpm = self._rpm[i]
             thrust = a_t + b_t * rpm + c_t * rpm * rpm
-            thrust = max(thrust, 0.0) * ge_factor
+            thrust = max(thrust, 0.0) * ge_factors[i]
             drag_torque = MOTOR_DIR[i] * (a_q + b_q * rpm + c_q * rpm * rpm)
 
             self.data.ctrl[self._act_force[i]] = thrust
@@ -1067,7 +1140,12 @@ class DroneAgent:
 
         return dpixelx, dpixely, dt
 
-    def send_sensor_data(self):
+    def enqueue_sensor_data(self):
+        """Read sensor state and enqueue packets for the sender thread.
+
+        Mirrors the Gazebo CrazySim architecture: physics thread enqueues,
+        dedicated sender thread drains queue and does UDP I/O.
+        """
         if not self._firmware_addr:
             return
         acc, gyro = self.read_imu()
@@ -1077,11 +1155,11 @@ class DroneAgent:
         if self._noise_model is not None:
             acc, gyro = self._noise_model.apply_imu_noise(acc, gyro)
 
-        self._sock.sendto(make_imu_packet(acc, gyro), self._firmware_addr)
+        self._send_q.append((make_imu_packet(acc, gyro), self._firmware_addr))
 
         # Send pose only when NOT using flowdeck
         if not self._flowdeck:
-            self._sock.sendto(make_pose_packet(pos, quat), self._firmware_addr)
+            self._send_q.append((make_pose_packet(pos, quat), self._firmware_addr))
 
         baro_period = 1.0 / BARO_RATE_HZ
         self._baro_acc += self.dt
@@ -1090,7 +1168,7 @@ class DroneAgent:
             alt = pos[2]
             if self._noise_model is not None:
                 alt = self._noise_model.apply_baro_noise(alt)
-            self._sock.sendto(make_baro_packet(alt), self._firmware_addr)
+            self._send_q.append((make_baro_packet(alt), self._firmware_addr))
 
         # Multi-ranger at RANGE_RATE_HZ
         range_period = 1.0 / RANGE_RATE_HZ
@@ -1098,8 +1176,8 @@ class DroneAgent:
         if self._range_acc >= range_period:
             self._range_acc -= range_period
             front, back, left, right, up = self.read_ranges()
-            self._sock.sendto(make_range_packet(front, back, left, right, up),
-                              self._firmware_addr)
+            self._send_q.append((make_range_packet(front, back, left, right, up),
+                                 self._firmware_addr))
 
         # Flowdeck: TOF + optical flow
         if self._flowdeck:
@@ -1108,15 +1186,15 @@ class DroneAgent:
             if self._tof_acc >= tof_period:
                 self._tof_acc -= tof_period
                 dist = self.read_tof_down()
-                self._sock.sendto(make_tof_packet(dist), self._firmware_addr)
+                self._send_q.append((make_tof_packet(dist), self._firmware_addr))
 
             flow_period = 1.0 / FLOW_RATE_HZ
             self._flow_acc += self.dt
             if self._flow_acc >= flow_period:
                 self._flow_acc -= flow_period
                 dpx, dpy, fdt = self.compute_flow()
-                self._sock.sendto(make_flow_packet(dpx, dpy, fdt),
-                                  self._firmware_addr)
+                self._send_q.append((make_flow_packet(dpx, dpy, fdt),
+                                     self._firmware_addr))
 
         # Camera rendering (must be called from main/physics thread)
         if self._camera is not None:
@@ -1126,9 +1204,10 @@ class DroneAgent:
         while not self._cflib_to_firmware_q.empty():
             try:
                 pkt = self._cflib_to_firmware_q.get_nowait()
-                self._sock.sendto(pkt, self._firmware_addr)
+                self._send_q.append((pkt, self._firmware_addr))
             except queue.Empty:
                 break
+
 
     def update_led_materials(self):
         """Apply the latest LED RGB colors to MuJoCo materials and light sources."""
@@ -1136,23 +1215,15 @@ class DroneAgent:
             bot_r, bot_g, bot_b = self._led_bot_rgb
             top_r, top_g, top_b = self._led_top_rgb
 
-        # Bottom LED: material + light
+        # Bottom LED: material only (no light emission to avoid illuminating other objects)
         bot_on = (bot_r > 0 or bot_g > 0 or bot_b > 0)
         if self._led_bot_mat_id >= 0:
             self.model.mat_rgba[self._led_bot_mat_id] = [bot_r, bot_g, bot_b, 1.0 if bot_on else 0.0]
-        if self._led_bot_light_id >= 0:
-            self.model.light_active[self._led_bot_light_id] = bot_on
-            self.model.light_diffuse[self._led_bot_light_id] = [bot_r, bot_g, bot_b]
-            self.model.light_specular[self._led_bot_light_id] = [bot_r * 0.3, bot_g * 0.3, bot_b * 0.3]
 
-        # Top LED: material + light
+        # Top LED: material only
         top_on = (top_r > 0 or top_g > 0 or top_b > 0)
         if self._led_top_mat_id >= 0:
             self.model.mat_rgba[self._led_top_mat_id] = [top_r, top_g, top_b, 1.0 if top_on else 0.0]
-        if self._led_top_light_id >= 0:
-            self.model.light_active[self._led_top_light_id] = top_on
-            self.model.light_diffuse[self._led_top_light_id] = [top_r, top_g, top_b]
-            self.model.light_specular[self._led_top_light_id] = [top_r * 0.3, top_g * 0.3, top_b * 0.3]
 
         # Headlight: material + light
         with self._headlight_lock:
@@ -1167,6 +1238,182 @@ class DroneAgent:
             else:
                 self.model.light_diffuse[self._headlight_light_id] = [0, 0, 0]
                 self.model.light_specular[self._headlight_light_id] = [0, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# Rover simulation (kinematic body driven by mecanum dynamics)
+# ---------------------------------------------------------------------------
+
+class RoverSim:
+    """Simulated rover driven by mecanum dynamics, rendered in MuJoCo.
+
+    The rover body is a MuJoCo freejoint body whose qpos/qvel are set
+    kinematically each step (not driven by MuJoCo forces). Collision
+    geoms on the landing pad interact with the drone.
+
+    Publishes ROS2 topics: /rover/odom, /vel_raw
+    Subscribes to: /cmd_vel
+    """
+
+    def __init__(self, model: mujoco.MjModel, data: mujoco.MjData,
+                 prefix: str = 'rover_', dt: float = 0.001,
+                 initial_pos: tuple[float, float] = (0.0, 0.0),
+                 initial_heading: float = 0.0,
+                 mirror_mode: bool = False):
+        self._mirror_mode = mirror_mode
+
+        import sys
+        if _ROVER_MODELS_DIR not in sys.path:
+            sys.path.insert(0, _ROVER_MODELS_DIR)
+        from mecanum_dynamics import mecanum_step, WHEEL_VEL_MAX, _inv_kinematics
+
+        self._mecanum_step = mecanum_step
+        self._inv_kinematics = _inv_kinematics
+        self._wheel_vel_max = WHEEL_VEL_MAX
+        self.model = model
+        self.data = data
+        self.dt = dt
+        self.prefix = prefix
+
+        # Find rover body and freejoint in MuJoCo model
+        self._body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                                           f'{prefix}rover')
+        # Find the freejoint for this body (type == mjJNT_FREE)
+        self._jnt_id = None
+        for j in range(model.njnt):
+            if model.jnt_bodyid[j] == self._body_id and model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE:
+                self._jnt_id = j
+                break
+        if self._jnt_id is None:
+            raise RuntimeError(f"No freejoint found for body '{prefix}rover' (id={self._body_id})")
+        self._qpos_adr = model.jnt_qposadr[self._jnt_id]
+        self._qvel_adr = model.jnt_dofadr[self._jnt_id]
+
+        # Find wheel hinge joints for visual spinning
+        self._wheel_qpos_adrs = []
+        for wname in ['wheel_fl_joint', 'wheel_fr_joint', 'wheel_bl_joint', 'wheel_br_joint']:
+            jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, f'{prefix}{wname}')
+            if jid >= 0:
+                self._wheel_qpos_adrs.append(model.jnt_qposadr[jid])
+            else:
+                self._wheel_qpos_adrs.append(None)
+        self._wheel_angles = np.zeros(4, dtype=np.float64)  # accumulated angles
+
+        # Mecanum state: [x, y, cos(θ), sin(θ), vx_body, vy_body, wz]
+        c0 = np.cos(initial_heading)
+        s0 = np.sin(initial_heading)
+        self.state = np.array([initial_pos[0], initial_pos[1], c0, s0, 0., 0., 0.],
+                              dtype=np.float64)
+
+        # Latest cmd_vel (body-frame)
+        self.cmd_vel = np.zeros(3, dtype=np.float64)  # [vx, vy, wz]
+        self._last_cmd_time = time.time()
+
+        # Set initial MuJoCo pose
+        self._sync_to_mujoco()
+
+    def _sync_to_mujoco(self):
+        """Write mecanum state to MuJoCo qpos/qvel."""
+        x, y, c, s = self.state[0], self.state[1], self.state[2], self.state[3]
+        vx_body, vy_body, wz = self.state[4], self.state[5], self.state[6]
+        theta = np.arctan2(s, c)
+
+        # Freejoint qpos: [x, y, z, qw, qx, qy, qz] (7D)
+        # Freejoint qpos: [x, y, z, qw, qx, qy, qz] (7D, world frame)
+        # The body XML has pos="0 0 0.0325" but freejoint qpos is absolute.
+        # The initial qpos from mj_resetData includes the body offset, but our
+        # explicit write overwrites it. We need z = body_offset = 0.0325.
+        _ROVER_BODY_Z = 0.065  # 2 * wheel_radius (body is 0.0325 above axle, axle is 0.0325 above ground)
+        qw = np.cos(theta / 2)
+        qz = np.sin(theta / 2)
+        self.data.qpos[self._qpos_adr:self._qpos_adr + 7] = [
+            x, y, _ROVER_BODY_Z, qw, 0.0, 0.0, qz
+        ]
+
+        # Freejoint qvel: [vx_world, vy_world, vz, wx, wy, wz] (6D)
+        vx_world = vx_body * c - vy_body * s
+        vy_world = vx_body * s + vy_body * c
+        self.data.qvel[self._qvel_adr:self._qvel_adr + 6] = [
+            vx_world, vy_world, 0.0, 0.0, 0.0, wz
+        ]
+
+        # Compute wheel angular velocities from body velocities (inverse kinematics)
+        # and integrate to get visual wheel angles
+        wheel_vels = self._inv_kinematics(vx_body, vy_body, wz)
+        self._wheel_angles += wheel_vels * self.dt
+        for i, adr in enumerate(self._wheel_qpos_adrs):
+            if adr is not None:
+                self.data.qpos[adr] = self._wheel_angles[i]
+
+    def step(self):
+        """Advance mecanum dynamics by one physics timestep and sync to MuJoCo."""
+        if self._mirror_mode:
+            # Mirror mode: state is set by UDP cmd recv thread, just sync to MuJoCo
+            self._sync_to_mujoco()
+            return
+        # Zero cmd_vel if no command received in 1 second
+        if time.time() - self._last_cmd_time > 1.0:
+            self.cmd_vel[:] = 0.0
+        cmd = self.cmd_vel.copy()
+        self.state = self._mecanum_step(self.state, cmd, self.dt, self._wheel_vel_max)
+        self._sync_to_mujoco()
+        self.publish_state_udp()
+
+    def start_ros2(self):
+        """Start UDP bridge for rover state/cmd_vel.
+
+        Replaces the old rclpy-in-thread approach with pure UDP sockets.
+        A separate ROS2 node (outside Docker, Jazzy) handles the ROS2 side.
+
+        UDP protocol (all little-endian doubles):
+          State (sim→bridge, port 19960): 7 doubles [x, y, cosθ, sinθ, vx, vy, wz]
+          Cmd   (bridge→sim, port 19961): 3 doubles [vx_cmd, vy_cmd, wz_cmd]
+        """
+        import struct
+
+        self._udp_state_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_cmd_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_cmd_sock.bind(('0.0.0.0', 19961))
+        self._udp_cmd_sock.setblocking(False)
+        self._bridge_addr = ('127.0.0.1', 19960)
+        self._udp_pub_acc = 0.0
+        self._udp_pub_period = 0.02  # 50Hz
+
+        # Receiver thread for cmd_vel OR mirror state (distinguished by packet size)
+        # 24 bytes = cmd_vel (3 doubles), 56 bytes = state (7 doubles, mirror mode)
+        def _cmd_recv_loop():
+            while True:
+                try:
+                    data = self._udp_cmd_sock.recv(56)
+                    if len(data) == 24:
+                        # cmd_vel: [vx, vy, wz]
+                        vx, vy, wz = struct.unpack('<3d', data)
+                        self.cmd_vel[0] = vx
+                        self.cmd_vel[1] = vy
+                        self.cmd_vel[2] = wz
+                        self._last_cmd_time = time.time()
+                    elif len(data) == 56:
+                        # Mirror state: [x, y, cos, sin, vx, vy, wz]
+                        self.state[:] = struct.unpack('<7d', data)
+                        self._last_cmd_time = time.time()
+                except BlockingIOError:
+                    time.sleep(0.001)
+                except Exception:
+                    break
+
+        threading.Thread(target=_cmd_recv_loop, daemon=True).start()
+        print(f'[rover_sim] UDP bridge started (state→{self._bridge_addr}, cmd←:19961)')
+
+    def publish_state_udp(self):
+        """Send rover state via UDP at configured rate. Called from physics loop."""
+        if not hasattr(self, '_udp_state_sock'):
+            return
+        self._udp_pub_acc += self.dt
+        if self._udp_pub_acc >= self._udp_pub_period:
+            self._udp_pub_acc -= self._udp_pub_period
+            import struct
+            pkt = struct.pack('<7d', *self.state)
+            self._udp_state_sock.sendto(pkt, self._bridge_addr)
 
 
 # ---------------------------------------------------------------------------
@@ -1191,10 +1438,16 @@ class CrazySimMuJoCo:
                  camera_enabled: bool = False,
                  cam_width: int = 324, cam_height: int = 244,
                  cam_fps: float = 20.0,
-                 cam_port: int | None = None):
+                 cam_port: int | None = None,
+                 rover_model: str | None = None,
+                 rover_pos: tuple[float, float] = (0.0, 0.0),
+                 rover_heading: float = 0.0,
+                 rover_mirror: bool = False,
+                 speed: float = 1.0):
         self.host = host
         self.visualize = visualize
         self.dt = timestep
+        self._speed = speed  # 0 = max speed, >0 = multiplier
         self.num_agents = len(spawn_positions)
         self._downwash = downwash
         self._flowdeck = flowdeck
@@ -1228,8 +1481,9 @@ class CrazySimMuJoCo:
         if features:
             print(f'[crazysim] features   : {", ".join(features)}')
 
-        # Build shared MuJoCo model with all drones
-        self.model = _build_spec_multi_safe(model_path, spawn_positions, params)
+        # Build shared MuJoCo model with all drones (+ optional rover)
+        self.model = _build_spec_multi_safe(model_path, spawn_positions, params,
+                                            rover_xml=rover_model, rover_pos=rover_pos)
         self.model.opt.timestep = self.dt
         self.data = mujoco.MjData(self.model)
 
@@ -1263,6 +1517,19 @@ class CrazySimMuJoCo:
                 flowdeck=flowdeck,
             )
             self.agents.append(agent)
+
+        # Create rover simulation (if model provided)
+        self.rover: RoverSim | None = None
+        if rover_model is not None:
+            self.rover = RoverSim(
+                model=self.model, data=self.data,
+                prefix='rover_', dt=self.dt,
+                initial_pos=rover_pos,
+                initial_heading=rover_heading,
+                mirror_mode=rover_mirror,
+            )
+            print(f'[crazysim] Rover sim created at ({rover_pos[0]}, {rover_pos[1]}), '
+                  f'heading={rover_heading:.2f} rad')
 
         self._running = False
 
@@ -1306,17 +1573,27 @@ class CrazySimMuJoCo:
         for agent in self.agents:
             agent.start_threads()
 
-        def _step_and_send():
-            """One physics step + CRTP packet dispatch for all agents."""
+        # Start rover ROS2 bridge (if rover is attached)
+        if self.rover is not None:
+            self.rover.start_ros2()
+
+        def _step_physics():
+            """Physics step only — must be called under viewer lock."""
             for agent in self.agents:
                 agent.update_motors()
                 agent.apply_aero_effects()
                 agent.update_led_materials()
             if self._downwash and self.num_agents > 1:
                 self._apply_downwash()
+            # Step rover BEFORE mj_step so collision is computed at correct position
+            if self.rover is not None:
+                self.rover.step()
             mujoco.mj_step(self.model, self.data)
+
+        def _enqueue_sensor_data():
+            """Enqueue sensor packets for async UDP send — no blocking I/O."""
             for agent in self.agents:
-                agent.send_sensor_data()
+                agent.enqueue_sensor_data()
 
         # Real-time factor tracking
         _rtf_interval = 1.0  # seconds between RTF updates
@@ -1345,7 +1622,7 @@ class CrazySimMuJoCo:
                 while v.is_running() and self._running:
                     t0 = time.perf_counter()
                     with v.lock():
-                        _step_and_send()
+                        _step_physics()
                         if _cam_init_frames > 0:
                             v.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
                             v.cam.azimuth = 0.0
@@ -1353,6 +1630,8 @@ class CrazySimMuJoCo:
                             v.cam.distance = 3.0
                             v.cam.lookat[:] = [0.0, 0.0, 0.5]
                             _cam_init_frames -= 1
+                    # Enqueue sensor packets — sender thread does UDP I/O
+                    _enqueue_sensor_data()
                     _update_rtf()
                     if t0 - _last_render >= _render_interval:
                         v.set_texts((
@@ -1369,21 +1648,30 @@ class CrazySimMuJoCo:
                         time.sleep(sleep_t)
             self._running = False
         else:
+            _rtf_print_acc = 0.0
             try:
                 while self._running:
                     t0 = time.perf_counter()
-                    _step_and_send()
+                    _step_physics()
+                    _enqueue_sensor_data()
                     _update_rtf()
+                    _rtf_print_acc += self.dt
+                    if _rtf_print_acc >= 2.0:
+                        _rtf_print_acc = 0.0
+                        print(f'\r[crazysim] RTF: {_rtf_value:.2f}x  t={self.data.time:.1f}s', end='', flush=True)
                     elapsed = time.perf_counter() - t0
                     sleep_t = self.dt - elapsed
                     if sleep_t > 0:
                         time.sleep(sleep_t)
             except KeyboardInterrupt:
                 pass
+            print()  # newline after RTF output
 
         self._running = False
         for agent in self.agents:
             agent.stop()
+        if self.rover is not None:
+            self.rover.stop()
         print('[crazysim] Done.')
 
 
@@ -1480,6 +1768,17 @@ def main():
                    help='Base TCP port for internal frame server '
                         '(default: 5100, agent N uses port+N). '
                         'Use crazysim_cpx.py to bridge to CPX clients.')
+    # --- Rover ---
+    p.add_argument('--rover-model', default=None,
+                   help='Path to rover MJCF XML (enables rover simulation)')
+    p.add_argument('--rover-pos', default='0,0',
+                   help='Rover spawn position as X,Y (default: 0,0)')
+    p.add_argument('--rover-heading', type=float, default=0.0,
+                   help='Rover initial heading [rad] (default: 0)')
+    p.add_argument('--rover-mirror', action='store_true',
+                   help='Mirror mode: rover follows /rover/odom instead of running dynamics')
+    p.add_argument('--speed', type=float, default=1.0,
+                   help='Simulation speed multiplier (default: 1.0 = real-time, 0 = max speed)')
     args = p.parse_args()
 
     # Override scene XML if provided
@@ -1531,6 +1830,22 @@ def main():
         dt=args.dt,
     ) if wind_active else None
 
+    # Parse rover args
+    rover_model_path = args.rover_model
+    if rover_model_path is not None:
+        if not os.path.isabs(rover_model_path) and not os.path.isfile(rover_model_path):
+            # Try relative to rover-models directory
+            alt = os.path.join(_ROVER_MODELS_DIR, rover_model_path)
+            if os.path.isfile(alt):
+                rover_model_path = alt
+            else:
+                alt2 = os.path.join(_HERE, rover_model_path)
+                if os.path.isfile(alt2):
+                    rover_model_path = alt2
+
+    rover_pos_parts = args.rover_pos.split(',')
+    rover_pos = (float(rover_pos_parts[0]), float(rover_pos_parts[1]))
+
     CrazySimMuJoCo(
         model_path=model_path,
         host=args.host,
@@ -1549,6 +1864,11 @@ def main():
         cam_height=args.cam_height,
         cam_fps=args.cam_fps,
         cam_port=args.cam_port,
+        rover_model=rover_model_path,
+        rover_pos=rover_pos,
+        rover_heading=args.rover_heading,
+        rover_mirror=args.rover_mirror,
+        speed=args.speed,
     ).run()
 
 

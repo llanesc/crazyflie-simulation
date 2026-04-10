@@ -1,0 +1,100 @@
+<!-- MuJoCo model for the Yahboom RosMaster X3 mecanum rover.
+     Used in CrazySim for drone-rover landing simulation.
+     Full render with chassis, screen holder, camera, lidar, and landing pad.
+
+     Rover motion is driven kinematically by mecanum_dynamics (not MuJoCo physics).
+     Collision geoms are active so the drone physically interacts with the landing pad.
+
+     Physical parameters:
+       wheel_radius   = 0.0325 m
+       wheel_sep      = 0.169 m  (left-right center-to-center)
+       wheel_xoff     = 0.08 m   (front-rear from base center)
+       total_height   = 0.1185 m (pad surface above ground)
+       pad_radius     = 0.115 m  (default, can be overridden)
+-->
+<mujoco model="rosmaster_x3">
+  <compiler meshdir="meshes" angle="radian"/>
+
+  <asset>
+    <mesh name="base"       file="base_link_X3_bracket_only.STL"/>
+    <mesh name="wheel_fl"   file="front_left_wheel_X3.STL"/>
+    <mesh name="wheel_fr"   file="front_right_wheel_X3.STL"/>
+    <mesh name="wheel_bl"   file="back_left_wheel_X3.STL"/>
+    <mesh name="wheel_br"   file="back_right_wheel_X3.STL"/>
+    <mesh name="camera"     file="camera_link.STL"/>
+    <mesh name="laser"      file="laser_link.STL"/>
+    <mesh name="pad_mesh"   file="landing_pad.STL"/>
+
+    <material name="chassis"    rgba="0.15 0.15 0.15 1"/>
+    <material name="wheel"      rgba="0.25 0.25 0.25 1"/>
+    <material name="pad"        rgba="0.8 0.2 0.2 1"/>
+    <material name="sensor"     rgba="0.3 0.3 0.3 1"/>
+  </asset>
+
+  <worldbody>
+    <body name="rover" pos="0 0 0">
+      <inertial pos="-0.031 0 0.107" mass="4.6"
+                diaginertia="0.03 0.04 0.02"/>
+
+      <!-- Chassis visual (full — with screen holder) -->
+      <geom type="mesh" mesh="base" material="chassis"
+            contype="0" conaffinity="0"/>
+
+      <!-- Chassis collision box (simplified, covers chassis + bracket) -->
+      <geom name="chassis_col" type="box" size="0.15 0.10 0.065"
+            pos="0 0 0.065"
+            contype="1" conaffinity="1" rgba="0 0 0 0"/>
+
+      <!-- Landing pad mesh (custom 3D printed part) -->
+      <!-- Offset: pad hole centers align with crossbar bolt holes -->
+      <!-- X: -0.1606, Y: 0.0004, Z: 0.112 -->
+      <geom name="pad_visual" type="mesh" mesh="pad_mesh" material="pad"
+            pos="-0.0384 0.0004 0.138"
+            euler="0 0 3.14159"
+            contype="0" conaffinity="0"/>
+      <!-- Collision box for the pad top surface (254x254mm) -->
+      <geom name="pad_geom" type="box" size="0.127 0.127 0.002"
+            pos="-0.0384 0.0004 0.148"
+            contype="1" conaffinity="1"
+            friction="0.8 0.005 0.0001"
+            rgba="0 0 0 0"/>
+
+      <!-- Camera (front of chassis) -->
+      <body name="camera_link" pos="0.057105 0.000018 0.03755">
+        <geom type="mesh" mesh="camera" material="sensor"
+              contype="0" conaffinity="0"/>
+      </body>
+
+      <!-- Lidar (top of chassis) -->
+      <body name="laser_link" pos="0.0435 0.000053 0.11">
+        <geom type="mesh" mesh="laser" material="sensor"
+              contype="0" conaffinity="0"/>
+      </body>
+
+      <!-- Wheels (visual only, no collision — motion is kinematic) -->
+      <body name="wheel_fl" pos="0.08 0.0845 -0.0325">
+        <joint name="wheel_fl_joint" type="hinge" axis="0 1 0"/>
+        <geom type="mesh" mesh="wheel_fl" material="wheel"
+              euler="1.5708 0 0" contype="0" conaffinity="0"/>
+      </body>
+
+      <body name="wheel_fr" pos="0.08 -0.0845 -0.0325">
+        <joint name="wheel_fr_joint" type="hinge" axis="0 1 0"/>
+        <geom type="mesh" mesh="wheel_fr" material="wheel"
+              euler="1.5708 0 0" contype="0" conaffinity="0"/>
+      </body>
+
+      <body name="wheel_bl" pos="-0.08 0.0845 -0.0325">
+        <joint name="wheel_bl_joint" type="hinge" axis="0 1 0"/>
+        <geom type="mesh" mesh="wheel_bl" material="wheel"
+              euler="1.5708 0 0" contype="0" conaffinity="0"/>
+      </body>
+
+      <body name="wheel_br" pos="-0.08 -0.0845 -0.0325">
+        <joint name="wheel_br_joint" type="hinge" axis="0 1 0"/>
+        <geom type="mesh" mesh="wheel_br" material="wheel"
+              euler="1.5708 0 0" contype="0" conaffinity="0"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

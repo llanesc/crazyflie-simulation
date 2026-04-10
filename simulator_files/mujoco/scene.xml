@@ -17,7 +17,7 @@
              rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
              markrgb="0.8 0.8 0.8" width="512" height="512"/>
     <material name="groundplane" texture="groundplane" texuniform="true"
-              texrepeat="2 2" reflectance="0.2"/>
+              texrepeat="2 2" reflectance="0"/>
   </asset>
 
   <worldbody>
